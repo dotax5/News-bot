@@ -1,0 +1,8 @@
+services:
+  newsbot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

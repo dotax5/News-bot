@@ -1,0 +1,9 @@
+.env
+*.session
+*.session-journal
+data/
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.ruff_cache/
