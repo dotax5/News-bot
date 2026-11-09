@@ -5,11 +5,10 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{2,31}$")
-TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
 class ChannelRefError(ValueError):
@@ -35,10 +34,6 @@ def utcnow() -> datetime:
 
 def iso_utc(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="seconds")
-
-
-def parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value)
 
 
 def parse_channel_ref(raw: str) -> ChannelRef:
@@ -83,8 +78,7 @@ def parse_channel_ref(raw: str) -> ChannelRef:
     if parts[0].lower() == "s" and len(parts) >= 2:
         parts = parts[1:]
 
-    first = parts[0]
-    first = first.removeprefix("@")
+    first = parts[0].removeprefix("@")
 
     if re.fullmatch(r"-?\d+", first):
         peer_id = int(first)
@@ -113,94 +107,10 @@ def telegram_post_url(username: str | None, peer_id: int | None, message_id: int
     return f"https://t.me/c/{raw}/{message_id}"
 
 
-def parse_digest_time(raw: str) -> tuple[int, int]:
-    match = TIME_RE.fullmatch(raw.strip())
-    if not match:
-        raise ValueError("Время должно быть в формате HH:MM, например 09:30.")
-    return int(match.group(1)), int(match.group(2))
-
-
-def normalize_digest_time(raw: str) -> str:
-    hours, minutes = parse_digest_time(raw)
-    return f"{hours:02d}:{minutes:02d}"
-
-
-def validate_timezone(raw: str) -> str:
-    name = raw.strip()
-    try:
-        ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(
-            f"Неизвестная таймзона {name!r}. Примеры: Europe/Moscow, Europe/Kyiv, Asia/Almaty, UTC."
-        ) from exc
-    return name
-
-
 def format_dt_local(value: datetime | str, tz_name: str, pattern: str = "%d.%m %H:%M") -> str:
     if isinstance(value, str):
-        value = parse_iso(value)
+        value = datetime.fromisoformat(value)
     return value.astimezone(ZoneInfo(tz_name)).strftime(pattern)
-
-
-def local_today(now: datetime, tz_name: str) -> date:
-    return now.astimezone(ZoneInfo(tz_name)).date()
-
-
-def initial_digest_date(now: datetime, tz_name: str, digest_time: str) -> str | None:
-    """Дата, на которую рассылка уже «закрыта» при регистрации.
-
-    Если время сегодня ещё не наступило — None, чтобы первый дайджест пришёл сегодня.
-    """
-    local = now.astimezone(ZoneInfo(tz_name))
-    hours, minutes = parse_digest_time(digest_time)
-    passed = (local.hour, local.minute) >= (hours, minutes)
-    return local.date().isoformat() if passed else None
-
-
-def schedule_date_after_change(now: datetime, tz_name: str, digest_time: str) -> str | None:
-    """После смены времени/таймзоны: если время ещё впереди — даём шанс отправить сегодня."""
-    return initial_digest_date(now, tz_name, digest_time)
-
-
-def digest_is_due(
-    now: datetime, tz_name: str, digest_time: str, last_digest_date: str | None
-) -> bool:
-    local = now.astimezone(ZoneInfo(tz_name))
-    hours, minutes = parse_digest_time(digest_time)
-    if (local.hour, local.minute) < (hours, minutes):
-        return False
-    return last_digest_date != local.date().isoformat()
-
-
-def next_digest_at(
-    now: datetime, tz_name: str, digest_time: str, last_digest_date: str | None
-) -> datetime:
-    tz = ZoneInfo(tz_name)
-    local = now.astimezone(tz)
-    hours, minutes = parse_digest_time(digest_time)
-    candidate = local.replace(hour=hours, minute=minutes, second=0, microsecond=0)
-    if last_digest_date == local.date().isoformat():
-        candidate += timedelta(days=1)
-    elif candidate <= local:
-        return local
-    return candidate
-
-
-def describe_next_digest(
-    now: datetime, tz_name: str, digest_time: str, last_digest_date: str | None
-) -> str:
-    tz = ZoneInfo(tz_name)
-    local_now = now.astimezone(tz)
-    target = next_digest_at(now, tz_name, digest_time, last_digest_date)
-    if target <= local_now + timedelta(seconds=5):
-        return "в ближайшую проверку"
-    if target.date() == local_now.date():
-        day = "сегодня"
-    elif target.date() == local_now.date() + timedelta(days=1):
-        day = "завтра"
-    else:
-        day = target.strftime("%d.%m.%Y")
-    return f"{day} в {target.strftime('%H:%M')} ({tz_name})"
 
 
 def shorten(text: str, limit: int) -> str:

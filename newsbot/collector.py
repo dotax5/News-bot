@@ -21,6 +21,7 @@ from telethon.utils import get_peer_id
 
 from .config import Settings
 from .db import Database
+from .delivery import PostDelivery
 from .models import Channel, ChannelInfo
 from .utils import (
     ChannelRef,
@@ -38,9 +39,15 @@ class CollectorError(RuntimeError):
 
 
 class NewsCollector:
-    def __init__(self, settings: Settings, db: Database) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        db: Database,
+        delivery: PostDelivery | None = None,
+    ) -> None:
         self._settings = settings
         self._db = db
+        self._delivery = delivery
         self._client: TelegramClient | None = None
         self._entity_cache: dict[int, tuple[Any, str | None, int]] = {}
         self._dialogs_refreshed = False
@@ -210,12 +217,25 @@ class NewsCollector:
                 await self._db.set_channel_error(
                     channel.id, f"{type(exc).__name__}: {exc}"
                 )
+            # Рассылаем сразу после каждого канала: подписчики не ждут
+            # окончания прохода по всем источникам.
+            await self._deliver()
             await asyncio.sleep(0.7)
+        await self._deliver()
         return total_new
+
+    async def _deliver(self) -> None:
+        if self._delivery is None:
+            return
+        try:
+            await self._delivery.deliver_pending()
+        except Exception:
+            log.exception("Не удалось разослать новые посты")
 
     async def _collect_channel(self, channel: Channel) -> int:
         entity, username, peer_id = await self._entity_for_channel(channel)
         messages = await self._fetch_messages(entity, channel)
+        is_first_pass = channel.last_message_id <= 0
         posts: list[tuple[int, str, str, str | None, bool]] = []
         max_id = channel.last_message_id
         seen_groups: set[int] = set()
@@ -250,7 +270,14 @@ class NewsCollector:
                 )
             )
 
-        inserted = await self._db.insert_posts(channel.id, posts)
+        inserted = await self._db.insert_posts(
+            channel.id, posts, notify=is_first_pass
+        )
+        if is_first_pass and inserted:
+            # Первый проход — это ещё не новости: рассылаем только последний
+            # пост канала, остальные сохраняем молча как историю.
+            newest_id = max(post[0] for post in posts)
+            await self._db.mark_post_pending(channel.id, newest_id)
         await self._db.update_channel_progress(
             channel.id, max_id, iso_utc(utcnow()), None
         )

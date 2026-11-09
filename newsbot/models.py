@@ -1,4 +1,4 @@
-"""Модели данных, общие для БД, сборщика и рендера дайджеста."""
+"""Модели данных, общие для БД, сборщика и рендера сообщений."""
 
 from __future__ import annotations
 
@@ -11,11 +11,7 @@ class User:
     tg_id: int
     username: str | None
     first_name: str | None
-    timezone: str
-    digest_time: str
     enabled: bool
-    last_digest_at: str | None
-    last_digest_date: str | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -49,7 +45,9 @@ class UserChannel:
 
 
 @dataclass(slots=True, frozen=True)
-class DigestPost:
+class PendingPost:
+    """Пост, который ещё не разослан подписчикам канала."""
+
     id: int
     channel_id: int
     message_id: int
@@ -59,4 +57,3 @@ class DigestPost:
     has_media: bool
     channel_title: str | None
     channel_username: str | None
-    channel_peer_id: int | None

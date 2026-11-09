@@ -10,8 +10,8 @@ from telethon.tl.types import Channel as TgChannel
 
 from newsbot.collector import NewsCollector
 from newsbot.db import Database
+from newsbot.delivery import PostDelivery
 from newsbot.models import ChannelInfo
-from newsbot.utils import iso_utc
 
 
 class FakeMessage:
@@ -47,51 +47,129 @@ class FakeTelethonClient:
             for message in reversed(selected):
                 yield message
 
+    def push(self, message: FakeMessage) -> None:
+        self.messages.append(message)
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+        self.sent.append((chat_id, text))
+
 
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self._tmp.name) / "test.sqlite3")
         await self.db.connect()
+        self.now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
+        self.settings = SimpleNamespace(
+            initial_fetch_limit=20,
+            collect_interval=60,
+            display_timezone="Europe/Moscow",
+        )
+        self.bot = FakeBot()
+        self.delivery = PostDelivery(
+            self.bot,  # type: ignore[arg-type]
+            self.db,
+            self.settings,  # type: ignore[arg-type]
+            send_delay=0,
+        )
+        self.user = await self.db.ensure_user(100, "tester", "Test", now=self.now)
+        self.channel, _ = await self.db.add_or_update_channel(
+            ChannelInfo(key="@test", tg_id=-100123, username="test", title="Тест")
+        )
+        await self.db.subscribe(self.user.id, self.channel.id)
 
     async def asyncTearDown(self) -> None:
         await self.db.close()
         self._tmp.cleanup()
 
-    async def test_initial_fetch_and_cursor(self) -> None:
-        now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
-        user = await self.db.ensure_user(
-            100, "tester", "Test", "Europe/Moscow", "09:00", now=now
-        )
-        channel, _ = await self.db.add_or_update_channel(
-            ChannelInfo(key="@test", tg_id=-100123, username="test", title="Тест")
-        )
-        await self.db.subscribe(user.id, channel.id)
-
-        messages = [
-            FakeMessage(1, "Старая", now - timedelta(hours=2)),
-            FakeMessage(2, "Средняя", now - timedelta(hours=1)),
-            FakeMessage(3, "Новая", now - timedelta(minutes=5)),
-        ]
+    def _collector(
+        self, client: FakeTelethonClient, *, with_delivery: bool = True
+    ) -> NewsCollector:
         collector = NewsCollector(
-            SimpleNamespace(initial_fetch_limit=20, collect_interval=300), self.db
+            self.settings,  # type: ignore[arg-type]
+            self.db,
+            self.delivery if with_delivery else None,
         )
-        collector._client = FakeTelethonClient(messages)
+        collector._client = client
+        return collector
 
-        inserted = await collector.collect_once()
-        self.assertEqual(inserted, 3)
+    async def test_first_pass_sends_only_latest_post(self) -> None:
+        messages = [
+            FakeMessage(1, "Старая", self.now - timedelta(hours=2)),
+            FakeMessage(2, "Средняя", self.now - timedelta(hours=1)),
+            FakeMessage(3, "Новая", self.now - timedelta(minutes=5)),
+        ]
+        collector = self._collector(FakeTelethonClient(messages))
 
-        stored = await self.db.get_digest_posts(
-            user.id, iso_utc(now - timedelta(days=1)), iso_utc(now), 10
+        self.assertEqual(await collector.collect_once(), 3)
+
+        self.assertEqual(len(self.bot.sent), 1)
+        chat_id, text = self.bot.sent[0]
+        self.assertEqual(chat_id, 100)
+        self.assertIn("Новая", text)
+        self.assertNotIn("Старая", text)
+        self.assertIn("https://t.me/test/3", text)
+
+        channel = await self.db.find_user_channel_by_ref(self.user.id, "@test")
+        assert channel is not None
+        self.assertEqual(channel.last_message_id, 3)
+        self.assertEqual(await self.db.list_pending_posts(), [])
+
+    async def test_new_post_is_sent_on_next_pass(self) -> None:
+        client = FakeTelethonClient(
+            [FakeMessage(3, "Новая", self.now - timedelta(minutes=5))]
         )
-        self.assertEqual([post.text for post in stored], ["Старая", "Средняя", "Новая"])
+        collector = self._collector(client)
+        await collector.collect_once()
 
-        channel_row = await self.db.find_user_channel_by_ref(user.id, "@test")
-        assert channel_row is not None
-        self.assertEqual(channel_row.last_message_id, 3)
+        client.push(FakeMessage(4, "Свежая", self.now))
+        self.assertEqual(await collector.collect_once(), 1)
 
-        # Повторный проход ничего не дублирует.
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertIn("Свежая", self.bot.sent[1][1])
+        self.assertIn("https://t.me/test/4", self.bot.sent[1][1])
+
+        # Повторный проход без новых постов ничего не отправляет и не дублирует.
         self.assertEqual(await collector.collect_once(), 0)
+        self.assertEqual(len(self.bot.sent), 2)
+
+    async def test_paused_user_gets_no_backlog_after_resume(self) -> None:
+        await self.db.set_user_enabled(self.user.id, False)
+        client = FakeTelethonClient(
+            [FakeMessage(3, "Новая", self.now - timedelta(minutes=5))]
+        )
+        collector = self._collector(client)
+
+        await collector.collect_once()
+        self.assertEqual(self.bot.sent, [])
+
+        client.push(FakeMessage(4, "Пока на паузе", self.now))
+        await collector.collect_once()
+        self.assertEqual(self.bot.sent, [])
+
+        await self.db.set_user_enabled(self.user.id, True)
+        await collector.collect_once()
+        self.assertEqual(self.bot.sent, [])
+
+    async def test_without_delivery_latest_post_stays_pending(self) -> None:
+        messages = [
+            FakeMessage(1, "Старая", self.now - timedelta(hours=2)),
+            FakeMessage(2, "Новая", self.now - timedelta(minutes=5)),
+        ]
+        collector = self._collector(
+            FakeTelethonClient(messages), with_delivery=False
+        )
+
+        await collector.collect_once()
+
+        self.assertEqual(
+            [post.text for post in await self.db.list_pending_posts()], ["Новая"]
+        )
 
 
 if __name__ == "__main__":

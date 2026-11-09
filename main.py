@@ -1,4 +1,4 @@
-"""News Digest Bot — точка входа."""
+"""News Bot — точка входа."""
 
 from __future__ import annotations
 
@@ -17,8 +17,7 @@ from newsbot.bot import bot_commands, build_router
 from newsbot.collector import CollectorError, NewsCollector
 from newsbot.config import ConfigError, Settings, load_settings
 from newsbot.db import Database
-from newsbot.digest import DigestService
-from newsbot.scheduler import DigestScheduler
+from newsbot.delivery import PostDelivery
 
 log = logging.getLogger(__name__)
 
@@ -75,21 +74,26 @@ async def main() -> None:
         me = await bot.get_me()
         log.info("Бот запущен: @%s", me.username)
 
+        delivery = PostDelivery(bot, db, settings)
         if settings.collector_enabled:
-            collector = NewsCollector(settings, db)
+            collector = NewsCollector(settings, db, delivery)
             await collector.start()
         else:
             log.warning(
                 "TELEGRAM_API_ID / TELEGRAM_API_HASH не заданы: сбор новостей выключен, "
-                "будут доступны только команды и уже сохранённые посты."
+                "будут доступны только команды."
             )
 
-        digest = DigestService(bot, db, settings)
-        scheduler = DigestScheduler(db, digest, settings)
-
         dispatcher = Dispatcher()
-        dispatcher.include_router(build_router(db, settings, collector, digest))
+        dispatcher.include_router(build_router(db, settings, collector))
         await bot.set_my_commands(bot_commands())
+
+        # Если прошлый запуск прервался между сбором поста и рассылкой,
+        # добираем очередь сразу, не дожидаясь первого прохода сборщика.
+        try:
+            await delivery.deliver_pending()
+        except Exception:
+            log.exception("Не удалось разослать очередь постов при запуске")
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -105,7 +109,6 @@ async def main() -> None:
                 ),
                 name="polling",
             ),
-            asyncio.create_task(scheduler.run(stop_event), name="scheduler"),
         ]
         if collector is not None:
             tasks.append(asyncio.create_task(collector.run(stop_event), name="collector"))

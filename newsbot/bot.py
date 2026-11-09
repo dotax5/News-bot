@@ -1,12 +1,9 @@
-"""Telegram-бот: команды, настройки и ручной дайджест."""
+"""Telegram-бот: команды и управление подписками."""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -15,27 +12,11 @@ from aiogram.types import BotCommand, Message
 from .collector import CollectorError, NewsCollector
 from .config import Settings
 from .db import Database
-from .digest import DigestService
 from .models import Channel, User
-from .rendering import CHUNK_LIMIT, ENTITY_LIMIT, build_no_channels_text
-from .utils import (
-    describe_next_digest,
-    format_dt_local,
-    h,
-    parse_digest_time,
-    schedule_date_after_change,
-    shorten,
-    utcnow,
-    utf16_len,
-    validate_timezone,
-)
+from .rendering import CHUNK_LIMIT, ENTITY_LIMIT
+from .utils import format_dt_local, h, shorten, utf16_len
 
 log = logging.getLogger(__name__)
-
-COMMON_TIMEZONES = (
-    "Europe/Moscow, Europe/Kyiv, Europe/Minsk, Asia/Almaty, Asia/Tbilisi, "
-    "Asia/Yerevan, Asia/Dubai, UTC"
-)
 
 
 def bot_commands() -> list[BotCommand]:
@@ -44,12 +25,9 @@ def bot_commands() -> list[BotCommand]:
         BotCommand(command="addchannel", description="Добавить канал-источник"),
         BotCommand(command="delchannel", description="Удалить канал"),
         BotCommand(command="channels", description="Список каналов"),
-        BotCommand(command="settime", description="Время рассылки, например 09:30"),
-        BotCommand(command="timezone", description="Часовой пояс"),
-        BotCommand(command="settings", description="Текущие настройки"),
-        BotCommand(command="digest", description="Прислать дайджест сейчас"),
-        BotCommand(command="pause", description="Пауза рассылки"),
-        BotCommand(command="resume", description="Возобновить рассылку"),
+        BotCommand(command="settings", description="Статус подписок"),
+        BotCommand(command="pause", description="Пауза уведомлений"),
+        BotCommand(command="resume", description="Возобновить уведомления"),
         BotCommand(command="help", description="Помощь"),
     ]
 
@@ -93,62 +71,58 @@ def _channel_handle(channel: Channel) -> str:
     return f" · @{h(channel.username)}" if channel.username else ""
 
 
-def _next_date_after_change(user: User, now: datetime, tz: str, time: str) -> str | None:
-    today = now.astimezone(ZoneInfo(tz)).date().isoformat()
-    if user.last_digest_date == today:
-        return today
-    return schedule_date_after_change(now, tz, time)
-
-
-def _welcome_text(user: User, channels: int) -> str:
+def _welcome_text(channels: int, settings: Settings) -> str:
     lines = [
-        "👋 <b>Привет!</b> Я собираю посты из Telegram-каналов и присылаю дайджест.",
+        (
+            "👋 <b>Привет!</b> Я присылаю новые посты из Telegram-каналов "
+            "сразу после публикации."
+        ),
         "",
-        f"⏰ Рассылка: <b>{user.digest_time}</b> ({h(user.timezone)})",
         f"📚 Каналов: <b>{channels}</b>",
+        f"⏱ Проверка каналов: каждые {settings.collect_interval} с",
         "",
         "<b>Команды</b>",
         "<code>/addchannel @username</code> — добавить источник",
         "<code>/delchannel @username</code> — убрать источник",
         "<code>/channels</code> — список каналов",
-        "<code>/settime 09:30</code> — время рассылки",
-        "<code>/timezone Europe/Moscow</code> — часовой пояс",
-        "<code>/settings</code> — текущие настройки",
-        "<code>/digest</code> — прислать дайджест сейчас",
+        "<code>/settings</code> — статус подписок",
         "<code>/pause</code> и <code>/resume</code> — пауза и возобновление",
         "",
         (
-            "<i>Аккаунт-сборщик должен состоять в закрытых каналах. "
-            "Публичные каналы читаются по @username.</i>"
+            "<i>При добавлении канала пришлю его последний пост, дальше — только "
+            "новые. Аккаунт-сборщик должен состоять в закрытых каналах.</i>"
         ),
     ]
     return "\n".join(lines)
 
 
-def _settings_text(user: User, channels: int, now: datetime) -> str:
-    status = "включена ✅" if user.enabled else "на паузе ⏸"
+def _settings_text(
+    user: User,
+    channels: int,
+    settings: Settings,
+    last_check_at: str | None,
+) -> str:
+    status = "включены ✅" if user.enabled else "на паузе ⏸"
     lines = [
         "⚙️ <b>Настройки</b>",
-        f"⏰ Время: <b>{user.digest_time}</b> ({h(user.timezone)})",
-        f"🔔 Рассылка: {status}",
+        f"🔔 Уведомления: {status}",
         f"📚 Каналов: <b>{channels}</b>",
-        f"🗓 Ближайшая: {describe_next_digest(now, user.timezone, user.digest_time, user.last_digest_date)}",
+        "🚀 Доставка: сразу после публикации",
+        f"⏱ Проверка каналов: каждые {settings.collect_interval} с",
     ]
-    if user.last_digest_at:
+    if last_check_at:
         lines.append(
-            f"🕓 Последний дайджест: {format_dt_local(user.last_digest_at, user.timezone, '%d.%m.%Y %H:%M')}"
+            "🕓 Последняя проверка: "
+            f"{format_dt_local(last_check_at, settings.display_timezone, '%d.%m.%Y %H:%M')}"
         )
+    else:
+        lines.append("🕓 Последняя проверка: ещё не было")
     if channels == 0:
         lines += ["", "Добавьте канал: <code>/addchannel @username</code>"]
     return "\n".join(lines)
 
 
-def build_router(
-    db: Database,
-    settings: Settings,
-    collector: NewsCollector | None,
-    digest: DigestService,
-) -> Router:
+def build_router(db: Database, settings: Settings, collector: NewsCollector | None) -> Router:
     router = Router(name="newsbot")
 
     async def _get_user(message: Message) -> User | None:
@@ -169,16 +143,14 @@ def build_router(
             message.from_user.id,
             message.from_user.username,
             message.from_user.first_name,
-            settings.default_timezone,
-            settings.default_digest_time,
         )
         if existing is None and settings.auto_subscribe_env_channels:
             await db.subscribe_env_channels(user.id)
         channels = await db.count_user_channels(user.id)
         prefix = ""
         if existing is not None:
-            prefix = "С возвращением! Настройки сохранены.\n\n"
-        await message.answer(prefix + _welcome_text(user, channels))
+            prefix = "С возвращением! Подписки сохранены.\n\n"
+        await message.answer(prefix + _welcome_text(channels, settings))
 
     @router.message(Command("help"))
     async def cmd_help(message: Message) -> None:
@@ -186,7 +158,7 @@ def build_router(
         if user is None:
             return
         channels = await db.count_user_channels(user.id)
-        await message.answer(_welcome_text(user, channels))
+        await message.answer(_welcome_text(channels, settings))
 
     @router.message(Command("addchannel"))
     async def cmd_add_channel(message: Message, command: CommandObject) -> None:
@@ -234,8 +206,8 @@ def build_router(
         await status.edit_text(
             f"✅ <b>{h(channel.title or channel.key)}</b>{_channel_handle(channel)}\n"
             f"{note}\n\n"
-            f"Сбор идёт каждые {settings.collect_interval // 60 or 1} мин. "
-            "В ближайший дайджест попадут посты, опубликованные после прошлой рассылки."
+            "Новые посты будут приходить сразу после публикации.\n"
+            "При первом сборе пришлю последний пост канала — историю не отправляю."
         )
 
     @router.message(Command("delchannel"))
@@ -267,7 +239,7 @@ def build_router(
         await db.unsubscribe(user.id, channel.id)
         await message.answer(
             f"🗑 Убрал <b>{h(channel.title or channel.key)}</b> из списка.\n"
-            "Уже сохранённые посты останутся в базе, но новые собираться не будут."
+            "Новые посты из него больше не приходят."
         )
 
     @router.message(Command("channels"))
@@ -290,7 +262,8 @@ def build_router(
             )
             if item.last_post_at:
                 lines.append(
-                    f"   последний пост: {format_dt_local(item.last_post_at, user.timezone)}"
+                    "   последний пост: "
+                    f"{format_dt_local(item.last_post_at, settings.display_timezone)}"
                 )
             else:
                 lines.append("   постов пока нет")
@@ -300,82 +273,14 @@ def build_router(
         lines.append("<i>Удалить: /delchannel 2</i>")
         await _answer_long(message, "\n".join(lines))
 
-    @router.message(Command("settime"))
-    async def cmd_settime(message: Message, command: CommandObject) -> None:
-        user = await _get_user(message)
-        if user is None:
-            return
-        raw = (command.args or "").strip()
-        if not raw:
-            await message.answer(
-                f"Сейчас рассылка в <b>{user.digest_time}</b> ({h(user.timezone)}).\n"
-                "Изменить: <code>/settime 09:30</code>"
-            )
-            return
-        try:
-            hours, minutes = parse_digest_time(raw)
-        except ValueError as exc:
-            await message.answer(f"❌ {h(str(exc))}")
-            return
-        new_time = f"{hours:02d}:{minutes:02d}"
-        now = utcnow()
-        last_date = _next_date_after_change(user, now, user.timezone, new_time)
-        await db.set_user_digest_time(user.id, new_time, last_date)
-        await message.answer(
-            f"✅ Время рассылки: <b>{new_time}</b> ({h(user.timezone)}).\n"
-            f"Ближайшая: {describe_next_digest(now, user.timezone, new_time, last_date)}"
-        )
-
-    @router.message(Command("timezone"))
-    async def cmd_timezone(message: Message, command: CommandObject) -> None:
-        user = await _get_user(message)
-        if user is None:
-            return
-        raw = (command.args or "").strip()
-        if not raw:
-            await message.answer(
-                f"Текущий часовой пояс: <b>{h(user.timezone)}</b>.\n\n"
-                f"Изменить: <code>/timezone Europe/Moscow</code>\n"
-                f"Частые варианты: {h(COMMON_TIMEZONES)}"
-            )
-            return
-        try:
-            timezone = validate_timezone(raw)
-        except ValueError as exc:
-            await message.answer(f"❌ {h(str(exc))}")
-            return
-        now = utcnow()
-        last_date = _next_date_after_change(user, now, timezone, user.digest_time)
-        await db.set_user_timezone(user.id, timezone, last_date)
-        await message.answer(
-            f"✅ Часовой пояс: <b>{h(timezone)}</b>.\n"
-            f"Время рассылки: <b>{user.digest_time}</b>.\n"
-            f"Ближайшая: {describe_next_digest(now, timezone, user.digest_time, last_date)}"
-        )
-
     @router.message(Command("settings"))
     async def cmd_settings(message: Message) -> None:
         user = await _get_user(message)
         if user is None:
             return
         channels = await db.count_user_channels(user.id)
-        await message.answer(_settings_text(user, channels, utcnow()))
-
-    @router.message(Command("digest"))
-    async def cmd_digest(message: Message) -> None:
-        user = await _get_user(message)
-        if user is None:
-            return
-        if await db.count_user_channels(user.id) == 0:
-            await message.answer(build_no_channels_text())
-            return
-        status = await message.answer("⏳ Формирую дайджест…")
-        result = await digest.send(user, manual=True)
-        if result.error:
-            await status.edit_text(f"❌ {h(result.error)}")
-            return
-        with contextlib.suppress(Exception):
-            await status.delete()
+        last_check = await db.last_channel_check_at(user.id)
+        await message.answer(_settings_text(user, channels, settings, last_check))
 
     @router.message(Command("pause"))
     async def cmd_pause(message: Message) -> None:
@@ -384,8 +289,8 @@ def build_router(
             return
         await db.set_user_enabled(user.id, False)
         await message.answer(
-            "⏸ Рассылка на паузе. Сбор по вашим каналам приостановлен.\n"
-            "После /resume бот наверстает пропущенные посты (в пределах лимита)."
+            "⏸ Уведомления на паузе.\n"
+            "Пропущенные посты не дошлю: после /resume будут приходить только новые."
         )
 
     @router.message(Command("resume"))
@@ -394,12 +299,8 @@ def build_router(
         if user is None:
             return
         await db.set_user_enabled(user.id, True)
-        updated = await db.get_user_by_id(user.id)
-        assert updated is not None
-
         await message.answer(
-            "▶️ Рассылка включена.\n"
-            f"Ближайшая: {describe_next_digest(utcnow(), updated.timezone, updated.digest_time, updated.last_digest_date)}"
+            "▶️ Уведомления включены. Новые посты снова приходят сразу после публикации."
         )
 
     @router.message(F.text.startswith("/"))

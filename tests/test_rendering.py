@@ -1,82 +1,72 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from newsbot.models import DigestPost, User
-from newsbot.rendering import ENTITY_LIMIT, _entity_count, build_digest_chunks
+from newsbot.models import PendingPost
+from newsbot.rendering import build_post_message
 from newsbot.utils import utf16_len
 
 
-def make_user() -> User:
-    return User(
-        id=1,
-        tg_id=1,
-        username="tester",
-        first_name="Test",
-        timezone="Europe/Moscow",
-        digest_time="09:00",
-        enabled=True,
-        last_digest_at="2026-11-06T06:00:00+00:00",
-        last_digest_date="2026-11-06",
-    )
+def make_post(**overrides: Any) -> PendingPost:
+    values: dict[str, Any] = {
+        "id": 1,
+        "channel_id": 1,
+        "message_id": 1,
+        "text": "Текст новости",
+        "posted_at": "2026-11-07T06:00:00+00:00",
+        "url": "https://t.me/test/1",
+        "has_media": False,
+        "channel_title": "Тестовый канал",
+        "channel_username": "test",
+    }
+    values.update(overrides)
+    return PendingPost(**values)
 
 
-def make_post(index: int, channel_id: int = 1, text: str | None = None) -> DigestPost:
-    posted_at = datetime(2026, 11, 7, 5, 0, tzinfo=UTC) + timedelta(
-        minutes=index
-    )
-    return DigestPost(
-        id=index,
-        channel_id=channel_id,
-        message_id=index,
-        text=text if text is not None else f"Новость номер {index} " + "текст " * 30,
-        posted_at=posted_at.isoformat(timespec="seconds"),
-        url=f"https://t.me/test/{index}",
-        has_media=False,
-        channel_title="Тестовый канал",
-        channel_username="test",
-        channel_peer_id=-1001234567890,
-    )
-
-
-class RenderingTests(unittest.TestCase):
-    def test_empty(self) -> None:
-        now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
-        self.assertEqual(
-            build_digest_chunks(make_user(), [], 0, now, "2026-11-06T06:00:00+00:00"), []
-        )
-
-    def test_chunks_respect_limit(self) -> None:
-        now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
-        posts = [make_post(i, channel_id=i % 3) for i in range(40)]
-        chunks = build_digest_chunks(
-            make_user(), posts, len(posts), now, "2026-11-06T06:00:00+00:00"
-        )
-        self.assertGreater(len(chunks), 1)
-        for chunk in chunks:
-            self.assertLessEqual(utf16_len(chunk), 3800)
-            self.assertLessEqual(_entity_count(chunk), ENTITY_LIMIT)
-        joined = "\n".join(chunks)
-        self.assertIn("Дайджест новостей", joined)
-        self.assertIn("Тестовый канал", joined)
-        self.assertIn("Новость номер 39", joined)
+class PostMessageTests(unittest.TestCase):
+    def test_message_structure(self) -> None:
+        text = build_post_message(make_post(), "Europe/Moscow")
+        self.assertIn("📢 <b>Тестовый канал</b> · @test", text)
+        self.assertIn("07.11.2026 09:00", text)
+        self.assertIn("Текст новости", text)
+        self.assertIn('<a href="https://t.me/test/1">Открыть пост ↗</a>', text)
 
     def test_html_escaped(self) -> None:
-        now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
-        post = make_post(0, text="<script>alert(1)</script> & <b>жирный</b>")
-        chunks = build_digest_chunks(
-            make_user(), [post], 1, now, "2026-11-06T06:00:00+00:00"
+        post = make_post(
+            text="<script>alert(1)</script> & <b>жирный</b>", channel_title="<i>"
         )
-        self.assertNotIn("<script>", "\n".join(chunks))
-        self.assertIn("&lt;script&gt;", "\n".join(chunks))
+        text = build_post_message(post, "UTC")
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("&amp;", text)
+        self.assertIn("&lt;i&gt;", text)
 
-    def test_truncation_note(self) -> None:
-        now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
-        chunks = build_digest_chunks(
-            make_user(), [make_post(0)], 100, now, "2026-11-06T06:00:00+00:00"
-        )
-        self.assertIn("Показаны последние 1 из 100", "\n".join(chunks))
+    def test_media_notes(self) -> None:
+        with_text = build_post_message(make_post(has_media=True), "UTC")
+        self.assertIn("📎 К посту приложено медиа", with_text)
+
+        media_only = build_post_message(make_post(text="", has_media=True), "UTC")
+        self.assertIn("📎 Медиа без текста", media_only)
+
+        text_only = build_post_message(make_post(text="", has_media=False), "UTC")
+        self.assertIn("🔗 Пост без текста", text_only)
+
+    def test_paragraphs_preserved(self) -> None:
+        post = make_post(text="Первый   абзац.\n\n\n\nВторой абзац.")
+        text = build_post_message(post, "UTC")
+        self.assertIn("Первый абзац.\n\nВторой абзац.", text)
+
+    def test_long_text_fits_telegram_limit(self) -> None:
+        text = build_post_message(make_post(text="слово " * 2000), "UTC")
+        self.assertLessEqual(utf16_len(text), 4096)
+        self.assertIn("…", text)
+
+    def test_fallbacks_without_url_and_handle(self) -> None:
+        post = make_post(url=None, channel_title=None, channel_username=None)
+        text = build_post_message(post, "UTC")
+        self.assertIn("📢 <b>канал</b>", text)
+        self.assertNotIn("Открыть пост", text)
 
 
 if __name__ == "__main__":

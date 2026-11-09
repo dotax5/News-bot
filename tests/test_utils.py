@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, datetime
 
 from newsbot.utils import (
     ChannelRefError,
-    digest_is_due,
-    next_digest_at,
+    format_dt_local,
+    h,
     parse_channel_ref,
-    parse_digest_time,
+    shorten,
     telegram_post_url,
     utf16_len,
 )
@@ -58,28 +57,23 @@ class ChannelRefTests(unittest.TestCase):
         self.assertIsNone(telegram_post_url(None, None, 10))
 
 
-class TimeTests(unittest.TestCase):
-    def test_parse_time(self) -> None:
-        self.assertEqual(parse_digest_time("9:05"), (9, 5))
-        self.assertEqual(parse_digest_time("23:59"), (23, 59))
-        for bad in ("24:00", "9", "09:60", "abc", "09:5"):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                parse_digest_time(bad)
+class FormatTests(unittest.TestCase):
+    def test_shorten(self) -> None:
+        self.assertEqual(shorten(" много   пробелов ", 50), "много пробелов")
 
-    def test_due(self) -> None:
-        now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)  # 09:00 MSK
-        self.assertTrue(digest_is_due(now, "Europe/Moscow", "09:00", None))
-        self.assertFalse(
-            digest_is_due(now, "Europe/Moscow", "09:00", "2026-11-07")
+        cut = shorten("слово " * 10, 12)
+        self.assertTrue(cut.endswith("…"))
+        self.assertLessEqual(len(cut), 13)
+
+    def test_escape(self) -> None:
+        self.assertEqual(h('<b>&"'), "&lt;b&gt;&amp;&quot;")
+        self.assertEqual(h(None), "")
+
+    def test_format_dt_local(self) -> None:
+        self.assertEqual(
+            format_dt_local("2026-11-07T06:00:00+00:00", "Europe/Moscow", "%d.%m %H:%M"),
+            "07.11 09:00",
         )
-        self.assertFalse(digest_is_due(now, "Europe/Moscow", "10:00", None))
-
-    def test_next_digest(self) -> None:
-        now = datetime(2026, 11, 7, 6, 0, tzinfo=UTC)
-        tomorrow = next_digest_at(now, "Europe/Moscow", "09:00", "2026-11-07")
-        self.assertEqual(tomorrow.date().isoformat(), "2026-11-08")
-        due_now = next_digest_at(now, "Europe/Moscow", "08:00", None)
-        self.assertEqual(due_now, now.astimezone(due_now.tzinfo))
 
     def test_utf16_len(self) -> None:
         self.assertEqual(utf16_len("abc"), 3)

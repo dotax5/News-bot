@@ -27,12 +27,9 @@ class Settings:
     session_string: str | None
     session_path: Path
     database_path: Path
-    default_timezone: str
-    default_digest_time: str
+    display_timezone: str
     collect_interval: int
     initial_fetch_limit: int
-    digest_max_posts: int
-    send_empty_digest: bool
     source_channels: tuple[str, ...]
     auto_subscribe_env_channels: bool
     log_level: str
@@ -106,17 +103,15 @@ def load_settings() -> Settings:
     if session_string and (session_string.startswith("PASTE") or session_string == "..."):
         session_string = None
 
-    timezone = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
+    timezone = (
+        os.getenv("DISPLAY_TIMEZONE", "").strip()
+        or os.getenv("DEFAULT_TIMEZONE", "").strip()
+        or "Europe/Moscow"
+    )
     try:
         ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ConfigError(f"Неизвестная таймзона DEFAULT_TIMEZONE: {timezone!r}") from exc
-
-    digest_time = os.getenv("DEFAULT_DIGEST_TIME", "09:00").strip() or "09:00"
-    if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", digest_time):
-        raise ConfigError("DEFAULT_DIGEST_TIME должен быть в формате HH:MM, например 09:30.")
-    hours, minutes = digest_time.split(":")
-    digest_time = f"{int(hours):02d}:{int(minutes):02d}"
+        raise ConfigError(f"Неизвестная таймзона DISPLAY_TIMEZONE: {timezone!r}") from exc
 
     return Settings(
         bot_token=bot_token,
@@ -127,12 +122,9 @@ def load_settings() -> Settings:
             os.getenv("TELEGRAM_SESSION_PATH", ""), DEFAULT_SESSION_PATH
         ),
         database_path=_resolve_path(os.getenv("DATABASE_PATH", ""), DEFAULT_DB_PATH),
-        default_timezone=timezone,
-        default_digest_time=digest_time,
-        collect_interval=max(_env_int("COLLECT_INTERVAL_SECONDS", 300, 30), 30),
+        display_timezone=timezone,
+        collect_interval=max(_env_int("COLLECT_INTERVAL_SECONDS", 60, 30), 30),
         initial_fetch_limit=max(_env_int("INITIAL_FETCH_LIMIT", 20, 1), 1),
-        digest_max_posts=max(_env_int("DIGEST_MAX_POSTS", 50, 1), 1),
-        send_empty_digest=_env_bool("SEND_EMPTY_DIGEST", False),
         source_channels=_split_list(os.getenv("SOURCE_CHANNELS", "")),
         auto_subscribe_env_channels=_env_bool("AUTO_SUBSCRIBE_ENV_CHANNELS", True),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",

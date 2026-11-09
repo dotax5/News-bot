@@ -11,23 +11,19 @@ from pathlib import Path
 
 import aiosqlite
 
-from .models import Channel, ChannelInfo, DigestPost, User, UserChannel
-from .utils import initial_digest_date, iso_utc, parse_channel_ref, utcnow
+from .models import Channel, ChannelInfo, PendingPost, User, UserChannel
+from .utils import iso_utc, parse_channel_ref, utcnow
 
 log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    tg_id            INTEGER NOT NULL UNIQUE,
-    username         TEXT,
-    first_name       TEXT,
-    timezone         TEXT NOT NULL,
-    digest_time      TEXT NOT NULL,
-    enabled          INTEGER NOT NULL DEFAULT 1,
-    last_digest_at   TEXT,
-    last_digest_date TEXT,
-    created_at       TEXT NOT NULL
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id      INTEGER NOT NULL UNIQUE,
+    username   TEXT,
+    first_name TEXT,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -64,12 +60,20 @@ CREATE TABLE IF NOT EXISTS posts (
     url         TEXT,
     has_media   INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL,
+    notified_at TEXT,
     UNIQUE (channel_id, message_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_channel_posted
     ON posts(channel_id, posted_at);
 CREATE INDEX IF NOT EXISTS idx_posts_posted ON posts(posted_at);
+"""
+
+# Индекс ссылается на posts.notified_at, поэтому создаётся после миграции
+# старой базы, а не вместе со схемой.
+PENDING_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_posts_pending
+    ON posts(notified_at) WHERE notified_at IS NULL;
 """
 
 
@@ -79,11 +83,7 @@ def _user_from_row(row: aiosqlite.Row) -> User:
         tg_id=row["tg_id"],
         username=row["username"],
         first_name=row["first_name"],
-        timezone=row["timezone"],
-        digest_time=row["digest_time"],
         enabled=bool(row["enabled"]),
-        last_digest_at=row["last_digest_at"],
-        last_digest_date=row["last_digest_date"],
     )
 
 
@@ -119,15 +119,67 @@ class Database:
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
-        await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
+        await self._conn.executescript(PENDING_INDEX)
+        await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
+
+    async def _columns(self, table: str) -> set[str]:
+        rows = await self._fetchall(f"PRAGMA table_info({table})")
+        return {row["name"] for row in rows}
+
+    async def _migrate(self) -> None:
+        """Приводит базу прежних версий к актуальной схеме.
+
+        Раньше у пользователей были timezone/digest_time/last_digest_*: пересобираем
+        таблицу без них. Внешние ключи на время пересборки выключаются, иначе
+        DROP TABLE users каскадно удалил бы подписки.
+        """
+        user_columns = await self._columns("users")
+        if {"timezone", "digest_time"} & user_columns:
+            log.info("Миграция: убираю расписание рассылки из таблицы users")
+            await self._conn.commit()
+            await self._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                await self._conn.executescript(
+                    """
+                    BEGIN;
+                    CREATE TABLE users_new (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tg_id      INTEGER NOT NULL UNIQUE,
+                        username   TEXT,
+                        first_name TEXT,
+                        enabled    INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL
+                    );
+                    INSERT INTO users_new (id, tg_id, username, first_name, enabled, created_at)
+                        SELECT id, tg_id, username, first_name, enabled, created_at FROM users;
+                    DROP TABLE users;
+                    ALTER TABLE users_new RENAME TO users;
+                    COMMIT;
+                    """
+                )
+            finally:
+                await self._conn.execute("PRAGMA foreign_keys=ON")
+
+        post_columns = await self._columns("posts")
+        if "notified_at" not in post_columns:
+            log.info("Миграция: добавляю posts.notified_at")
+            await self._conn.execute("ALTER TABLE posts ADD COLUMN notified_at TEXT")
+            # Посты, собранные прежними версиями, уже попали в дайджесты:
+            # повторно рассылать их не нужно.
+            await self._conn.execute(
+                "UPDATE posts SET notified_at = created_at WHERE notified_at IS NULL"
+            )
+
+        await self._conn.commit()
 
     # ------------------------------------------------------------------ users
 
@@ -136,32 +188,19 @@ class Database:
         tg_id: int,
         username: str | None,
         first_name: str | None,
-        default_timezone: str,
-        default_digest_time: str,
         now: datetime | None = None,
     ) -> User:
         now = now or utcnow()
-        last_date = initial_digest_date(now, default_timezone, default_digest_time)
         async with self._lock:
             await self.conn.execute(
                 """
-                INSERT INTO users (tg_id, username, first_name, timezone, digest_time,
-                                   enabled, last_digest_at, last_digest_date, created_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                INSERT INTO users (tg_id, username, first_name, enabled, created_at)
+                VALUES (?, ?, ?, 1, ?)
                 ON CONFLICT(tg_id) DO UPDATE SET
                     username = excluded.username,
                     first_name = excluded.first_name
                 """,
-                (
-                    tg_id,
-                    username,
-                    first_name,
-                    default_timezone,
-                    default_digest_time,
-                    iso_utc(now),
-                    last_date,
-                    iso_utc(now),
-                ),
+                (tg_id, username, first_name, iso_utc(now)),
             )
             await self.conn.commit()
             row = await self._fetchone("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
@@ -172,49 +211,23 @@ class Database:
         row = await self._fetchone("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
         return _user_from_row(row) if row else None
 
-    async def get_user_by_id(self, user_id: int) -> User | None:
-        row = await self._fetchone("SELECT * FROM users WHERE id = ?", (user_id,))
-        return _user_from_row(row) if row else None
-
-    async def list_users(self, enabled_only: bool = False) -> list[User]:
-        sql = "SELECT * FROM users"
-        if enabled_only:
-            sql += " WHERE enabled = 1"
-        sql += " ORDER BY id"
-        rows = await self._fetchall(sql)
-        return [_user_from_row(row) for row in rows]
-
-    async def set_user_digest_time(
-        self, user_id: int, digest_time: str, last_digest_date: str | None
-    ) -> None:
-        await self._execute(
-            "UPDATE users SET digest_time = ?, last_digest_date = ? WHERE id = ?",
-            (digest_time, last_digest_date, user_id),
-        )
-
-    async def set_user_timezone(
-        self, user_id: int, timezone: str, last_digest_date: str | None
-    ) -> None:
-        await self._execute(
-            "UPDATE users SET timezone = ?, last_digest_date = ? WHERE id = ?",
-            (timezone, last_digest_date, user_id),
-        )
-
     async def set_user_enabled(self, user_id: int, enabled: bool) -> None:
         await self._execute(
             "UPDATE users SET enabled = ? WHERE id = ?", (1 if enabled else 0, user_id)
         )
 
-    async def mark_digest_sent(self, user_id: int, sent_at: str, local_date: str) -> None:
-        await self._execute(
-            "UPDATE users SET last_digest_at = ?, last_digest_date = ? WHERE id = ?",
-            (sent_at, local_date, user_id),
+    async def list_channel_subscribers(self, channel_id: int) -> list[User]:
+        rows = await self._fetchall(
+            """
+            SELECT u.*
+            FROM users u
+            JOIN user_channels uc ON uc.user_id = u.id
+            WHERE uc.channel_id = ? AND u.enabled = 1
+            ORDER BY u.id
+            """,
+            (channel_id,),
         )
-
-    async def set_last_digest_at(self, user_id: int, sent_at: str) -> None:
-        await self._execute(
-            "UPDATE users SET last_digest_at = ? WHERE id = ?", (sent_at, user_id)
-        )
+        return [_user_from_row(row) for row in rows]
 
     # --------------------------------------------------------------- channels
 
@@ -310,13 +323,6 @@ class Database:
             await self.conn.commit()
             return cursor.rowcount > 0
 
-    async def is_subscribed(self, user_id: int, channel_id: int) -> bool:
-        row = await self._fetchone(
-            "SELECT 1 FROM user_channels WHERE user_id = ? AND channel_id = ?",
-            (user_id, channel_id),
-        )
-        return row is not None
-
     async def unsubscribe(self, user_id: int, channel_id: int) -> bool:
         async with self._lock:
             cursor = await self.conn.execute(
@@ -329,18 +335,6 @@ class Database:
     async def count_user_channels(self, user_id: int) -> int:
         row = await self._fetchone(
             "SELECT COUNT(*) AS n FROM user_channels WHERE user_id = ?", (user_id,)
-        )
-        return int(row["n"]) if row else 0
-
-    async def count_unchecked_channels(self, user_id: int) -> int:
-        row = await self._fetchone(
-            """
-            SELECT COUNT(*) AS n
-            FROM user_channels uc
-            JOIN channels c ON c.id = uc.channel_id
-            WHERE uc.user_id = ? AND c.last_checked_at IS NULL
-            """,
-            (user_id,),
         )
         return int(row["n"]) if row else 0
 
@@ -382,16 +376,32 @@ class Database:
         return _channel_from_row(row) if row else None
 
     async def channels_to_collect(self) -> list[Channel]:
+        """Каналы, у которых есть хотя бы один подписчик.
+
+        Собираем даже при паузе у всех подписчиков: курсор канала продолжает
+        двигаться, поэтому после /resume не приходит залп пропущенных постов.
+        """
         rows = await self._fetchall(
             """
             SELECT DISTINCT c.*
             FROM channels c
             JOIN user_channels uc ON uc.channel_id = c.id
-            JOIN users u ON u.id = uc.user_id AND u.enabled = 1
             ORDER BY c.id
             """
         )
         return [_channel_from_row(row) for row in rows]
+
+    async def last_channel_check_at(self, user_id: int) -> str | None:
+        row = await self._fetchone(
+            """
+            SELECT MAX(c.last_checked_at) AS t
+            FROM channels c
+            JOIN user_channels uc ON uc.channel_id = c.id
+            WHERE uc.user_id = ?
+            """,
+            (user_id,),
+        )
+        return row["t"] if row else None
 
     async def update_channel_meta(
         self, channel_id: int, tg_id: int, username: str | None, title: str | None
@@ -436,10 +446,22 @@ class Database:
         self,
         channel_id: int,
         posts: Iterable[tuple[int, str, str, str | None, bool]],
+        *,
+        notify: bool = True,
     ) -> int:
+        """Сохраняет посты. notify=False — оставить их в очереди на рассылку."""
         now = iso_utc(utcnow())
         rows = [
-            (channel_id, message_id, text, posted_at, url, 1 if has_media else 0, now)
+            (
+                channel_id,
+                message_id,
+                text,
+                posted_at,
+                url,
+                1 if has_media else 0,
+                now,
+                now if notify else None,
+            )
             for message_id, text, posted_at, url, has_media in posts
         ]
         if not rows:
@@ -448,36 +470,36 @@ class Database:
             cursor = await self.conn.executemany(
                 """
                 INSERT OR IGNORE INTO posts
-                    (channel_id, message_id, text, posted_at, url, has_media, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (channel_id, message_id, text, posted_at, url, has_media,
+                     created_at, notified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
             await self.conn.commit()
             return max(cursor.rowcount, 0)
 
-    async def get_digest_posts(
-        self, user_id: int, since: str, until: str, limit: int
-    ) -> list[DigestPost]:
+    async def mark_post_pending(self, channel_id: int, message_id: int) -> None:
+        """Возвращает пост в очередь рассылки (последний пост при первом сборе)."""
+        await self._execute(
+            "UPDATE posts SET notified_at = NULL WHERE channel_id = ? AND message_id = ?",
+            (channel_id, message_id),
+        )
+
+    async def list_pending_posts(self, limit: int = 100) -> list[PendingPost]:
         rows = await self._fetchall(
             """
-            SELECT * FROM (
-                SELECT p.id, p.channel_id, p.message_id, p.text, p.posted_at, p.url, p.has_media,
-                       c.title AS channel_title, c.username AS channel_username,
-                       c.tg_id AS channel_peer_id
-                FROM posts p
-                JOIN channels c ON c.id = p.channel_id
-                JOIN user_channels uc ON uc.channel_id = p.channel_id AND uc.user_id = ?
-                WHERE p.posted_at > ? AND p.posted_at <= ?
-                ORDER BY p.posted_at DESC
-                LIMIT ?
-            )
-            ORDER BY posted_at ASC
+            SELECT p.*, c.title AS channel_title, c.username AS channel_username
+            FROM posts p
+            JOIN channels c ON c.id = p.channel_id
+            WHERE p.notified_at IS NULL
+            ORDER BY p.posted_at, p.id
+            LIMIT ?
             """,
-            (user_id, since, until, limit),
+            (limit,),
         )
         return [
-            DigestPost(
+            PendingPost(
                 id=row["id"],
                 channel_id=row["channel_id"],
                 message_id=row["message_id"],
@@ -487,22 +509,14 @@ class Database:
                 has_media=bool(row["has_media"]),
                 channel_title=row["channel_title"],
                 channel_username=row["channel_username"],
-                channel_peer_id=row["channel_peer_id"],
             )
             for row in rows
         ]
 
-    async def count_digest_posts(self, user_id: int, since: str, until: str) -> int:
-        row = await self._fetchone(
-            """
-            SELECT COUNT(*) AS n
-            FROM posts p
-            JOIN user_channels uc ON uc.channel_id = p.channel_id AND uc.user_id = ?
-            WHERE p.posted_at > ? AND p.posted_at <= ?
-            """,
-            (user_id, since, until),
+    async def mark_post_notified(self, post_id: int, notified_at: str) -> None:
+        await self._execute(
+            "UPDATE posts SET notified_at = ? WHERE id = ?", (notified_at, post_id)
         )
-        return int(row["n"]) if row else 0
 
     # ----------------------------------------------------------------- helpers
 
