@@ -57,7 +57,7 @@ def main() -> None:
         system_version="1.0",
         app_version="1.0",
     ) as client:
-        me = client.get_me()
+        me = client.loop.run_until_complete(client.get_me())
         print(f"\nУспешно вошли как {me.first_name or ''} @{me.username or me.id}")
 
         if isinstance(session, StringSession):
