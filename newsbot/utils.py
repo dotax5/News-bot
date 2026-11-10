@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -123,6 +124,29 @@ def shorten(text: str, limit: int) -> str:
 
 def utf16_len(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
+
+
+def join_int_ids(ids: Iterable[int]) -> str:
+    """Складывает id в строку CSV: так они хранятся в SQLite."""
+    return ",".join(str(value) for value in ids)
+
+
+def parse_int_ids(raw: str | None) -> tuple[int, ...]:
+    """Разбирает CSV с id, молча пропуская мусор и повторы."""
+    if not raw:
+        return ()
+    seen: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value not in seen:
+            seen.append(value)
+    return tuple(seen)
 
 
 def h(value: str | None) -> str:

@@ -7,8 +7,27 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from newsbot.db import Database
-from newsbot.models import ChannelInfo
+from newsbot.models import ChannelInfo, NewPost
 from newsbot.utils import iso_utc
+
+
+def make_post(
+    message_id: int,
+    text: str,
+    posted_at: str,
+    url: str | None = None,
+    *,
+    has_media: bool = False,
+    source_ids: tuple[int, ...] | None = None,
+) -> NewPost:
+    return NewPost(
+        message_id=message_id,
+        source_message_ids=source_ids or (message_id,),
+        text=text,
+        posted_at=posted_at,
+        url=url,
+        has_media=has_media,
+    )
 
 LEGACY_SCHEMA = """
 CREATE TABLE users (
@@ -92,14 +111,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         posted_at = iso_utc(now - timedelta(hours=1))
         inserted = await self.db.insert_posts(
             channel.id,
-            [(1, "Первая новость", posted_at, "https://t.me/test/1", False)],
+            [make_post(1, "Первая новость", posted_at, "https://t.me/test/1")],
             notify=False,
         )
         self.assertEqual(inserted, 1)
         self.assertEqual(
             await self.db.insert_posts(
                 channel.id,
-                [(1, "Дубль", posted_at, None, False)],
+                [make_post(1, "Дубль", posted_at)],
             ),
             0,
         )
@@ -116,7 +135,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         # Уведомление о новом посте из insert_posts(notify=True) не ждёт рассылки.
         await self.db.insert_posts(
             channel.id,
-            [(2, "Вторая новость", posted_at, None, False)],
+            [make_post(2, "Вторая новость", posted_at)],
         )
         self.assertEqual(await self.db.list_pending_posts(), [])
 
@@ -152,17 +171,17 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         await self.db.insert_posts(
             alice_channel.id,
-            [(1, "Новость Алисы", iso_utc(now - timedelta(minutes=90)), None, False)],
+            [make_post(1, "Новость Алисы", iso_utc(now - timedelta(minutes=90)))],
             notify=False,
         )
         await self.db.insert_posts(
             bob_channel.id,
-            [(1, "Новость Боба", iso_utc(now - timedelta(minutes=50)), None, False)],
+            [make_post(1, "Новость Боба", iso_utc(now - timedelta(minutes=50)))],
             notify=False,
         )
         await self.db.insert_posts(
             shared_channel.id,
-            [(1, "Общая новость", iso_utc(now - timedelta(minutes=10)), None, False)],
+            [make_post(1, "Общая новость", iso_utc(now - timedelta(minutes=10)))],
             notify=False,
         )
 
@@ -259,17 +278,168 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         # Посты прежних версий уже разошлись в дайджестах — повторно не шлём.
         self.assertEqual(await self.db.list_pending_posts(), [])
 
+        cursor = await self.db.conn.execute(
+            "SELECT source_message_ids, media_state FROM posts WHERE message_id = 5"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        assert row is not None
+        self.assertEqual(row["source_message_ids"], "5")
+        self.assertEqual(row["media_state"], "pending")
+
         channel, _ = await self.db.add_or_update_channel(
             ChannelInfo(key="@test", tg_id=-100123, username="test", title="Тест")
         )
         await self.db.insert_posts(
             channel.id,
-            [(6, "Новый пост", created_at, "https://t.me/test/6", False)],
+            [make_post(6, "Новый пост", created_at, "https://t.me/test/6")],
             notify=False,
         )
         self.assertEqual(
             [post.text for post in await self.db.list_pending_posts()], ["Новый пост"]
         )
+
+    async def test_media_columns_are_migrated_from_previous_version(self) -> None:
+        await self.db.close()
+        path = self.db.path
+        path.unlink(missing_ok=True)
+        created_at = "2026-11-07T06:00:00+00:00"
+        con = sqlite3.connect(path)
+        try:
+            con.executescript(LEGACY_SCHEMA)
+            con.execute("ALTER TABLE posts ADD COLUMN notified_at TEXT")
+            con.execute(
+                """
+                INSERT INTO channels (key, tg_id, username, title, source,
+                                      last_message_id, created_at)
+                VALUES ('@test', -100123, 'test', 'Тест', 'user', 5, ?)
+                """,
+                (created_at,),
+            )
+            con.execute(
+                """
+                INSERT INTO posts (channel_id, message_id, text, posted_at, url,
+                                   has_media, created_at, notified_at)
+                VALUES (1, 5, 'Старый пост', ?, NULL, 1, ?, NULL)
+                """,
+                (created_at, created_at),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        await self.db.connect()
+
+        cursor = await self.db.conn.execute("PRAGMA table_info(posts)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        await cursor.close()
+        self.assertTrue(
+            {
+                "source_message_ids",
+                "mirror_chat_id",
+                "mirror_message_ids",
+                "mirror_requested_at",
+                "media_state",
+            }
+            <= columns
+        )
+
+        pending = await self.db.list_pending_posts()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].source_message_ids, (5,))
+        self.assertEqual(pending[0].mirror_message_ids, ())
+        self.assertEqual(pending[0].media_state, "pending")
+        self.assertTrue(pending[0].has_media)
+
+    async def test_post_mirror_state(self) -> None:
+        now = datetime(2026, 11, 7, 8, 0, tzinfo=UTC)
+        channel, _ = await self.db.add_or_update_channel(
+            ChannelInfo(key="@album", tg_id=-100999, username="album", title="Альбом")
+        )
+        await self.db.insert_posts(
+            channel.id,
+            [
+                make_post(
+                    10,
+                    "Подпись",
+                    iso_utc(now),
+                    "https://t.me/album/10",
+                    has_media=True,
+                    source_ids=(10, 11, 12),
+                )
+            ],
+            notify=False,
+        )
+
+        post = (await self.db.list_pending_posts())[0]
+        self.assertEqual(post.source_message_ids, (10, 11, 12))
+        self.assertEqual(post.mirror_message_ids, ())
+        self.assertEqual(post.channel_tg_id, -100999)
+
+        await self.db.set_post_mirror(post.id, 777, (502, 501, 500))
+        post = (await self.db.list_pending_posts())[0]
+        self.assertEqual(post.mirror_chat_id, 777)
+        self.assertEqual(post.mirror_message_ids, (500, 501, 502))
+        self.assertEqual(post.copy_message_ids, (500, 501, 502))
+        self.assertEqual(post.media_state, "ok")
+
+        await self.db.mark_post_mirror_failed(post.id)
+        self.assertEqual((await self.db.list_pending_posts())[0].media_state, "failed")
+
+    async def test_attach_mirror_message_from_bot(self) -> None:
+        now = datetime(2026, 11, 7, 9, 0, tzinfo=UTC)
+        channel, _ = await self.db.add_or_update_channel(
+            ChannelInfo(key="@attach", tg_id=-100998, username="attach", title="A")
+        )
+        await self.db.insert_posts(
+            channel.id,
+            [
+                make_post(
+                    10,
+                    "Альбом",
+                    iso_utc(now),
+                    has_media=True,
+                    source_ids=(10, 11),
+                )
+            ],
+            notify=False,
+        )
+        post = (await self.db.list_pending_posts())[0]
+
+        self.assertEqual(post.mirror_requested_at, None)
+        await self.db.mark_post_mirror_requested(post.id, iso_utc(now))
+        state = await self.db.get_post_mirror(post.id)
+        assert state is not None
+        self.assertEqual(state.media_state, "requested")
+        self.assertEqual(state.mirror_requested_at, iso_utc(now))
+
+        # Бот присылает свои id; дубликат не добавляется.
+        self.assertEqual(
+            await self.db.attach_mirror_message(-100998, 11, 9001, 501), post.id
+        )
+        await self.db.attach_mirror_message(-100998, 11, 9001, 501)
+        await self.db.attach_mirror_message(-100998, 10, 9001, 500)
+        state = await self.db.get_post_mirror(post.id)
+        assert state is not None
+        self.assertEqual(state.mirror_chat_id, 9001)
+        self.assertEqual(state.mirror_message_ids, (500, 501))
+        # media_state остаётся requested, пока доставка не подтвердит копию.
+        self.assertEqual(state.media_state, "requested")
+
+        # Чужой источник и чужой канал игнорируются.
+        self.assertIsNone(await self.db.attach_mirror_message(-100998, 99, 9001, 999))
+        self.assertIsNone(await self.db.attach_mirror_message(-100111, 10, 9001, 500))
+
+        await self.db.reset_post_mirror(post.id)
+        state = await self.db.get_post_mirror(post.id)
+        assert state is not None
+        self.assertEqual(state.media_state, "pending")
+        self.assertEqual(state.mirror_message_ids, ())
+        self.assertIsNone(state.mirror_requested_at)
+
+        # Уже разосланный пост бот не трогает.
+        await self.db.mark_post_notified(post.id, iso_utc(now))
+        self.assertIsNone(await self.db.attach_mirror_message(-100998, 10, 9001, 700))
 
 
 if __name__ == "__main__":

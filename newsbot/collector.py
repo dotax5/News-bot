@@ -22,7 +22,7 @@ from telethon.utils import get_peer_id
 from .config import Settings
 from .db import Database
 from .delivery import PostDelivery
-from .models import Channel, ChannelInfo
+from .models import Channel, ChannelInfo, NewPost
 from .utils import (
     ChannelRef,
     iso_utc,
@@ -52,6 +52,11 @@ class NewsCollector:
         self._entity_cache: dict[int, tuple[Any, str | None, int]] = {}
         self._dialogs_refreshed = False
         self.me: str | None = None
+        self.me_id: int | None = None
+
+    def set_delivery(self, delivery: PostDelivery) -> None:
+        """Привязывает доставку после её создания (нужен уже подключённый клиент)."""
+        self._delivery = delivery
 
     @property
     def client(self) -> TelegramClient:
@@ -104,6 +109,7 @@ class NewsCollector:
             )
 
         me = await self._client.get_me()
+        self.me_id = me.id if me else None
         self.me = f"@{me.username}" if me and me.username else str(me.id if me else "?")
         log.info("Сборщик авторизован как %s", self.me)
 
@@ -236,39 +242,12 @@ class NewsCollector:
         entity, username, peer_id = await self._entity_for_channel(channel)
         messages = await self._fetch_messages(entity, channel)
         is_first_pass = channel.last_message_id <= 0
-        posts: list[tuple[int, str, str, str | None, bool]] = []
+        posts = self._build_posts(messages, username, peer_id)
         max_id = channel.last_message_id
-        seen_groups: set[int] = set()
-
         for message in messages:
             message_id = getattr(message, "id", None)
-            if message_id is None:
-                continue
-            max_id = max(max_id, message_id)
-            if getattr(message, "action", None) is not None:
-                continue
-
-            grouped_id = getattr(message, "grouped_id", None)
-            if grouped_id is not None:
-                if grouped_id in seen_groups:
-                    continue
-                seen_groups.add(grouped_id)
-
-            text = (getattr(message, "message", None) or "").strip()
-            has_media = getattr(message, "media", None) is not None
-            if not text and not has_media:
-                continue
-
-            posted_at = getattr(message, "date", None) or utcnow()
-            posts.append(
-                (
-                    message_id,
-                    text[:4000],
-                    iso_utc(posted_at),
-                    telegram_post_url(username, peer_id, message_id),
-                    has_media,
-                )
-            )
+            if message_id is not None:
+                max_id = max(max_id, message_id)
 
         inserted = await self._db.insert_posts(
             channel.id, posts, notify=is_first_pass
@@ -276,14 +255,81 @@ class NewsCollector:
         if is_first_pass and inserted:
             # Первый проход — это ещё не новости: рассылаем только последний
             # пост канала, остальные сохраняем молча как историю.
-            newest_id = max(post[0] for post in posts)
-            await self._db.mark_post_pending(channel.id, newest_id)
+            newest_id = max(
+                (ids for post in posts for ids in post.source_message_ids),
+                default=0,
+            )
+            newest = next(
+                (post for post in posts if newest_id in post.source_message_ids),
+                None,
+            )
+            if newest is not None:
+                await self._db.mark_post_pending(channel.id, newest.message_id)
         await self._db.update_channel_progress(
             channel.id, max_id, iso_utc(utcnow()), None
         )
         if inserted:
             log.info("Канал %s: сохранено %s новых постов", channel.key, inserted)
         return inserted
+
+    def _build_posts(
+        self,
+        messages: list[Any],
+        username: str | None,
+        peer_id: int,
+    ) -> list[NewPost]:
+        """Склеивает сообщения в посты: альбом (grouped_id) — один пост.
+
+        Сообщения приходят по возрастанию id, поэтому порядок альбомов
+        сохраняется, а представителем поста служит его первое сообщение.
+        """
+        buckets: list[list[Any]] = []
+        group_index: dict[int, int] = {}
+        for message in messages:
+            if getattr(message, "id", None) is None:
+                continue
+            if getattr(message, "action", None) is not None:
+                continue
+            grouped_id = getattr(message, "grouped_id", None)
+            if grouped_id is None:
+                buckets.append([message])
+                continue
+            index = group_index.get(grouped_id)
+            if index is None:
+                group_index[grouped_id] = len(buckets)
+                buckets.append([message])
+            else:
+                buckets[index].append(message)
+
+        posts: list[NewPost] = []
+        for bucket in buckets:
+            ids = tuple(sorted(message.id for message in bucket))
+            text = next(
+                (
+                    (getattr(message, "message", None) or "").strip()
+                    for message in bucket
+                    if (getattr(message, "message", None) or "").strip()
+                ),
+                "",
+            )
+            has_media = any(
+                getattr(message, "media", None) is not None for message in bucket
+            )
+            if not text and not has_media:
+                continue
+            representative = ids[0]
+            posted_at = getattr(bucket[0], "date", None) or utcnow()
+            posts.append(
+                NewPost(
+                    message_id=representative,
+                    source_message_ids=ids,
+                    text=text[:4000],
+                    posted_at=iso_utc(posted_at),
+                    url=telegram_post_url(username, peer_id, representative),
+                    has_media=has_media,
+                )
+            )
+        return posts
 
     async def _fetch_messages(self, entity: Any, channel: Channel) -> list[Any]:
         if channel.last_message_id <= 0:

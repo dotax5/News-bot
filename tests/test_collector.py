@@ -15,13 +15,21 @@ from newsbot.models import ChannelInfo
 
 
 class FakeMessage:
-    def __init__(self, message_id: int, text: str, date: datetime) -> None:
+    def __init__(
+        self,
+        message_id: int,
+        text: str,
+        date: datetime,
+        *,
+        media: object | None = None,
+        grouped_id: int | None = None,
+    ) -> None:
         self.id = message_id
         self.message = text
         self.date = date
-        self.media = None
+        self.media = media
         self.action = None
-        self.grouped_id = None
+        self.grouped_id = grouped_id
 
 
 class FakeTelethonClient:
@@ -170,6 +178,44 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [post.text for post in await self.db.list_pending_posts()], ["Новая"]
         )
+
+    async def test_album_is_stored_as_one_post(self) -> None:
+        await self.db.update_channel_progress(
+            self.channel.id, 9, self.now.isoformat()
+        )
+        messages = [
+            FakeMessage(
+                10, "Подпись к альбому", self.now, media=object(), grouped_id=77
+            ),
+            FakeMessage(11, "", self.now, media=object(), grouped_id=77),
+            FakeMessage(12, "", self.now, media=object(), grouped_id=77),
+        ]
+        collector = self._collector(FakeTelethonClient(messages), with_delivery=False)
+
+        self.assertEqual(await collector.collect_once(), 1)
+
+        pending = await self.db.list_pending_posts()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].source_message_ids, (10, 11, 12))
+        self.assertEqual(pending[0].text, "Подпись к альбому")
+        self.assertTrue(pending[0].has_media)
+        self.assertEqual(pending[0].url, "https://t.me/test/10")
+
+    async def test_first_pass_album_sends_only_latest_post(self) -> None:
+        messages = [
+            FakeMessage(10, "Старый альбом", self.now - timedelta(hours=1), grouped_id=1),
+            FakeMessage(11, "", self.now - timedelta(hours=1), grouped_id=1),
+            FakeMessage(12, "Новый альбом", self.now, media=object(), grouped_id=2),
+            FakeMessage(13, "", self.now, media=object(), grouped_id=2),
+        ]
+        collector = self._collector(FakeTelethonClient(messages))
+
+        await collector.collect_once()
+
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertIn("Новый альбом", self.bot.sent[0][1])
+        self.assertNotIn("Старый альбом", self.bot.sent[0][1])
+        self.assertEqual(await self.db.list_pending_posts(), [])
 
 
 if __name__ == "__main__":

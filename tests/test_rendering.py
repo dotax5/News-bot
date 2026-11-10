@@ -19,6 +19,12 @@ def make_post(**overrides: Any) -> PendingPost:
         "has_media": False,
         "channel_title": "Тестовый канал",
         "channel_username": "test",
+        "channel_tg_id": None,
+        "source_message_ids": (1,),
+        "mirror_chat_id": None,
+        "mirror_message_ids": (),
+        "mirror_requested_at": None,
+        "media_state": "pending",
     }
     values.update(overrides)
     return PendingPost(**values)

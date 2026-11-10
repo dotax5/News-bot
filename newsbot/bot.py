@@ -7,7 +7,7 @@ import logging
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BotCommand, Message
+from aiogram.types import BotCommand, Message, MessageOriginChannel
 
 from .collector import CollectorError, NewsCollector
 from .config import Settings
@@ -101,13 +101,20 @@ def _settings_text(
     channels: int,
     settings: Settings,
     last_check_at: str | None,
+    exact_copy: bool,
 ) -> str:
     status = "включены ✅" if user.enabled else "на паузе ⏸"
+    media = (
+        "копия поста целиком (фото/видео)"
+        if exact_copy
+        else "текст и ссылка на оригинал"
+    )
     lines = [
         "⚙️ <b>Настройки</b>",
         f"🔔 Уведомления: {status}",
         f"📚 Каналов: <b>{channels}</b>",
         "🚀 Доставка: сразу после публикации",
+        f"📎 Посты: {media}",
         f"⏱ Проверка каналов: каждые {settings.collect_interval} с",
     ]
     if last_check_at:
@@ -122,7 +129,14 @@ def _settings_text(
     return "\n".join(lines)
 
 
-def build_router(db: Database, settings: Settings, collector: NewsCollector | None) -> Router:
+def build_router(
+    db: Database,
+    settings: Settings,
+    collector: NewsCollector | None,
+    *,
+    exact_copy: bool = False,
+    collector_id: int | None = None,
+) -> Router:
     router = Router(name="newsbot")
 
     async def _get_user(message: Message) -> User | None:
@@ -133,6 +147,24 @@ def build_router(db: Database, settings: Settings, collector: NewsCollector | No
             await message.answer("Сначала отправьте /start.")
             return None
         return user
+
+    @router.message(F.forward_origin)
+    async def remember_mirror(message: Message) -> None:
+        """Запоминает id поста, пересланного боту аккаунтом-сборщиком.
+
+        В личных чатах id сообщений у каждого аккаунта свои, поэтому id из
+        сессии сборщика боту не подходят — берём те, что пришли в апдейте.
+        """
+        if collector_id is None or message.from_user is None:
+            return
+        if message.from_user.id != collector_id:
+            return
+        origin = message.forward_origin
+        if not isinstance(origin, MessageOriginChannel):
+            return
+        await db.attach_mirror_message(
+            origin.chat.id, origin.message_id, message.chat.id, message.message_id
+        )
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
@@ -280,7 +312,9 @@ def build_router(db: Database, settings: Settings, collector: NewsCollector | No
             return
         channels = await db.count_user_channels(user.id)
         last_check = await db.last_channel_check_at(user.id)
-        await message.answer(_settings_text(user, channels, settings, last_check))
+        await message.answer(
+            _settings_text(user, channels, settings, last_check, exact_copy)
+        )
 
     @router.message(Command("pause"))
     async def cmd_pause(message: Message) -> None:

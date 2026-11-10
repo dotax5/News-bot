@@ -11,8 +11,16 @@ from pathlib import Path
 
 import aiosqlite
 
-from .models import Channel, ChannelInfo, PendingPost, User, UserChannel
-from .utils import iso_utc, parse_channel_ref, utcnow
+from .models import (
+    Channel,
+    ChannelInfo,
+    NewPost,
+    PendingPost,
+    PostMirrorState,
+    User,
+    UserChannel,
+)
+from .utils import iso_utc, join_int_ids, parse_channel_ref, parse_int_ids, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +67,11 @@ CREATE TABLE IF NOT EXISTS posts (
     posted_at   TEXT NOT NULL,
     url         TEXT,
     has_media   INTEGER NOT NULL DEFAULT 0,
+    source_message_ids TEXT NOT NULL DEFAULT '',
+    mirror_chat_id     INTEGER,
+    mirror_message_ids TEXT,
+    mirror_requested_at TEXT,
+    media_state        TEXT NOT NULL DEFAULT 'pending',
     created_at  TEXT NOT NULL,
     notified_at TEXT,
     UNIQUE (channel_id, message_id)
@@ -178,6 +191,27 @@ class Database:
             await self._conn.execute(
                 "UPDATE posts SET notified_at = created_at WHERE notified_at IS NULL"
             )
+
+        # Медиа-копия: пост пересылается в чат бота, а оттуда копируется
+        # подписчикам. Колонки добавляются по одной, чтобы миграция была
+        # безопасной при частично обновлённой базе.
+        media_columns = {
+            "source_message_ids": "TEXT NOT NULL DEFAULT ''",
+            "mirror_chat_id": "INTEGER",
+            "mirror_message_ids": "TEXT",
+            "mirror_requested_at": "TEXT",
+            "media_state": "TEXT NOT NULL DEFAULT 'pending'",
+        }
+        for name, ddl in media_columns.items():
+            if name not in post_columns:
+                log.info("Миграция: добавляю posts.%s", name)
+                await self._conn.execute(f"ALTER TABLE posts ADD COLUMN {name} {ddl}")
+        await self._conn.execute(
+            """
+            UPDATE posts SET source_message_ids = CAST(message_id AS TEXT)
+            WHERE source_message_ids = ''
+            """
+        )
 
         await self._conn.commit()
 
@@ -445,7 +479,7 @@ class Database:
     async def insert_posts(
         self,
         channel_id: int,
-        posts: Iterable[tuple[int, str, str, str | None, bool]],
+        posts: Iterable[NewPost],
         *,
         notify: bool = True,
     ) -> int:
@@ -454,15 +488,16 @@ class Database:
         rows = [
             (
                 channel_id,
-                message_id,
-                text,
-                posted_at,
-                url,
-                1 if has_media else 0,
+                post.message_id,
+                post.text,
+                post.posted_at,
+                post.url,
+                1 if post.has_media else 0,
+                join_int_ids(post.source_message_ids or (post.message_id,)),
                 now,
                 now if notify else None,
             )
-            for message_id, text, posted_at, url, has_media in posts
+            for post in posts
         ]
         if not rows:
             return 0
@@ -471,8 +506,8 @@ class Database:
                 """
                 INSERT OR IGNORE INTO posts
                     (channel_id, message_id, text, posted_at, url, has_media,
-                     created_at, notified_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     source_message_ids, created_at, notified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -489,7 +524,8 @@ class Database:
     async def list_pending_posts(self, limit: int = 100) -> list[PendingPost]:
         rows = await self._fetchall(
             """
-            SELECT p.*, c.title AS channel_title, c.username AS channel_username
+            SELECT p.*, c.title AS channel_title, c.username AS channel_username,
+                   c.tg_id AS channel_tg_id
             FROM posts p
             JOIN channels c ON c.id = p.channel_id
             WHERE p.notified_at IS NULL
@@ -509,9 +545,117 @@ class Database:
                 has_media=bool(row["has_media"]),
                 channel_title=row["channel_title"],
                 channel_username=row["channel_username"],
+                channel_tg_id=row["channel_tg_id"],
+                source_message_ids=parse_int_ids(row["source_message_ids"])
+                or (row["message_id"],),
+                mirror_chat_id=row["mirror_chat_id"],
+                mirror_message_ids=parse_int_ids(row["mirror_message_ids"]),
+                mirror_requested_at=row["mirror_requested_at"],
+                media_state=row["media_state"],
             )
             for row in rows
         ]
+
+    async def get_post_mirror(self, post_id: int) -> PostMirrorState | None:
+        row = await self._fetchone(
+            """
+            SELECT id, media_state, mirror_chat_id, mirror_message_ids,
+                   mirror_requested_at
+            FROM posts WHERE id = ?
+            """,
+            (post_id,),
+        )
+        if row is None:
+            return None
+        return PostMirrorState(
+            post_id=row["id"],
+            media_state=row["media_state"],
+            mirror_chat_id=row["mirror_chat_id"],
+            mirror_message_ids=parse_int_ids(row["mirror_message_ids"]),
+            mirror_requested_at=row["mirror_requested_at"],
+        )
+
+    async def mark_post_mirror_requested(self, post_id: int, requested_at: str) -> None:
+        """Пост переслан боту: ждём id сообщений из его апдейтов."""
+        await self._execute(
+            """
+            UPDATE posts
+            SET media_state = 'requested', mirror_requested_at = ?
+            WHERE id = ?
+            """,
+            (requested_at, post_id),
+        )
+
+    async def reset_post_mirror(self, post_id: int) -> None:
+        """Сбрасывает старые id перед повторной пересылкой поста боту."""
+        await self._execute(
+            """
+            UPDATE posts
+            SET mirror_chat_id = NULL, mirror_message_ids = NULL,
+                mirror_requested_at = NULL, media_state = 'pending'
+            WHERE id = ?
+            """,
+            (post_id,),
+        )
+
+    async def attach_mirror_message(
+        self,
+        channel_tg_id: int,
+        source_message_id: int,
+        chat_id: int,
+        message_id: int,
+    ) -> int | None:
+        """Сохраняет id сообщения из чата бота для поста-источника.
+
+        В личных чатах id сообщений у каждого аккаунта свои, поэтому id,
+        которые видит бот, нельзя получить из сессии сборщика — только из
+        входящих пересылок.
+        """
+        rows = await self._fetchall(
+            """
+            SELECT p.id, p.source_message_ids, p.mirror_message_ids
+            FROM posts p
+            JOIN channels c ON c.id = p.channel_id
+            WHERE c.tg_id = ? AND p.notified_at IS NULL
+            ORDER BY p.id DESC
+            """,
+            (channel_tg_id,),
+        )
+        for row in rows:
+            if source_message_id not in parse_int_ids(row["source_message_ids"]):
+                continue
+            ids = list(parse_int_ids(row["mirror_message_ids"]))
+            if message_id in ids:
+                return row["id"]
+            ids.append(message_id)
+            await self._execute(
+                """
+                UPDATE posts SET mirror_chat_id = ?, mirror_message_ids = ?
+                WHERE id = ?
+                """,
+                (chat_id, join_int_ids(sorted(ids)), row["id"]),
+            )
+            return row["id"]
+        return None
+
+    async def set_post_mirror(
+        self, post_id: int, chat_id: int, message_ids: Iterable[int]
+    ) -> None:
+        """Запоминает, где лежит копия поста в чате бота."""
+        await self._execute(
+            """
+            UPDATE posts
+            SET mirror_chat_id = ?, mirror_message_ids = ?, media_state = 'ok'
+            WHERE id = ?
+            """,
+            (chat_id, join_int_ids(sorted(message_ids)), post_id),
+        )
+
+    async def mark_post_mirror_failed(self, post_id: int) -> None:
+        """Пост нельзя скопировать: дальше шлём текстовую версию со ссылкой."""
+        await self._execute(
+            "UPDATE posts SET media_state = 'failed' WHERE id = ?", (post_id,)
+        )
 
     async def mark_post_notified(self, post_id: int, notified_at: str) -> None:
         await self._execute(

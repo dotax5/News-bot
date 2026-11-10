@@ -6,7 +6,9 @@ from newsbot.utils import (
     ChannelRefError,
     format_dt_local,
     h,
+    join_int_ids,
     parse_channel_ref,
+    parse_int_ids,
     shorten,
     telegram_post_url,
     utf16_len,
@@ -78,6 +80,13 @@ class FormatTests(unittest.TestCase):
     def test_utf16_len(self) -> None:
         self.assertEqual(utf16_len("abc"), 3)
         self.assertEqual(utf16_len("😴"), 2)
+
+    def test_int_id_csv(self) -> None:
+        self.assertEqual(join_int_ids([500, 501]), "500,501")
+        self.assertEqual(parse_int_ids("500, 501"), (500, 501))
+        self.assertEqual(parse_int_ids("500,500,x,,501"), (500, 501))
+        self.assertEqual(parse_int_ids(""), ())
+        self.assertEqual(parse_int_ids(None), ())
 
 
 if __name__ == "__main__":

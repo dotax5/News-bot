@@ -45,6 +45,29 @@ class UserChannel:
 
 
 @dataclass(slots=True, frozen=True)
+class NewPost:
+    """Новый пост канала: альбом считается одним постом."""
+
+    message_id: int
+    source_message_ids: tuple[int, ...]
+    text: str
+    posted_at: str
+    url: str | None
+    has_media: bool
+
+
+@dataclass(slots=True, frozen=True)
+class PostMirrorState:
+    """Состояние копии поста в чате бота."""
+
+    post_id: int
+    media_state: str
+    mirror_chat_id: int | None
+    mirror_message_ids: tuple[int, ...]
+    mirror_requested_at: str | None
+
+
+@dataclass(slots=True, frozen=True)
 class PendingPost:
     """Пост, который ещё не разослан подписчикам канала."""
 
@@ -57,3 +80,14 @@ class PendingPost:
     has_media: bool
     channel_title: str | None
     channel_username: str | None
+    channel_tg_id: int | None
+    source_message_ids: tuple[int, ...]
+    mirror_chat_id: int | None
+    mirror_message_ids: tuple[int, ...]
+    mirror_requested_at: str | None
+    media_state: str
+
+    @property
+    def copy_message_ids(self) -> tuple[int, ...]:
+        """id сообщений в чате-хранилище, готовые для copyMessages."""
+        return tuple(sorted(self.mirror_message_ids))
