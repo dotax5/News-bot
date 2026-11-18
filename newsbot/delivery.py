@@ -1,9 +1,14 @@
-"""Моментальная рассылка новых постов подписчикам каналов."""
+"""Моментальная рассылка постов подписчикам каналов.
+
+Медиа скачивается сборщиком заранее (см. newsbot/collector.py), поэтому здесь
+мы только собираем сообщение из готовых файлов и отправляем его ботом.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -12,13 +17,20 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
-from aiogram.types import LinkPreviewOptions
+from aiogram.types import (
+    FSInputFile,
+    InputMediaAnimation,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    LinkPreviewOptions,
+)
 
 from .config import Settings
 from .db import Database
-from .mirror import MediaMirror, MirrorPending, MirrorResult, MirrorRetry
-from .models import PendingPost, User
-from .rendering import build_post_message
+from .models import MediaItem, PendingPost, User
+from .rendering import build_post_caption, build_post_message
 from .utils import iso_utc, utcnow
 
 log = logging.getLogger(__name__)
@@ -26,6 +38,8 @@ log = logging.getLogger(__name__)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 SEND_DELAY = 0.05
 MAX_RETRY_AFTER = 60
+# Telegram Bot API: не больше 10 элементов в одном альбоме.
+ALBUM_LIMIT = 10
 
 
 class PostDelivery:
@@ -38,13 +52,11 @@ class PostDelivery:
         settings: Settings,
         *,
         send_delay: float = SEND_DELAY,
-        mirror: MediaMirror | None = None,
     ) -> None:
         self._bot = bot
         self._db = db
         self._settings = settings
         self._send_delay = send_delay
-        self._mirror = mirror
         self._lock = asyncio.Lock()
 
     async def deliver_pending(self) -> int:
@@ -60,91 +72,80 @@ class PostDelivery:
             subscribers = await self._db.list_channel_subscribers(post.channel_id)
             if not subscribers:
                 await self._db.mark_post_notified(post.id, iso_utc(utcnow()))
+                self._cleanup_media(post)
                 continue
 
             try:
-                target = await self._mirror.ensure(post) if self._mirror else None
-            except MirrorPending as exc:
-                # Пост уже переслан боту, но его id ещё не пришли: не теряем
-                # пост и не задерживаем остальные.
-                log.info("Жду копию от бота: %s", exc)
-                continue
-            except MirrorRetry as exc:
-                # Не теряем пост: попробуем на следующем проходе.
-                log.warning("Копия поста отложена: %s", exc)
-                break
-
-            if target is not None:
-                used_copy = await self._send_copies(subscribers, post, target)
-            else:
-                used_copy = False
-                await self._send_texts(subscribers, post)
+                await self._send_post(subscribers, post)
+            except Exception:
+                log.exception(
+                    "Не удалось разослать пост %s/%s",
+                    post.channel_username or post.channel_id,
+                    post.message_id,
+                )
             await self._db.mark_post_notified(post.id, iso_utc(utcnow()))
+            self._cleanup_media(post)
             log.info(
                 "Пост %s/%s разослан %s подписчикам (%s)",
                 post.channel_username or post.channel_id,
                 post.message_id,
                 len(subscribers),
-                "копия" if used_copy else "текст",
+                "медиа" if any(item.path for item in post.media) else "текст",
             )
         return len(posts)
 
-    async def _send_copies(
+    # ---------------------------------------------------------------- sending
+
+    async def _send_post(self, subscribers: list[User], post: PendingPost) -> None:
+        text = build_post_message(post, self._settings.display_timezone)
+        media = [item for item in post.media if item.path and not item.skipped]
+        caption = (
+            build_post_caption(post, self._settings.display_timezone)
+            if media
+            else text
+        )
+
+        for index, user in enumerate(subscribers):
+            # Сбой на одном подписчике не должен лишать поста остальных.
+            try:
+                if media:
+                    await self._send_with_media(user, media, caption, text)
+                    step = self._send_delay * max(1, len(media))
+                else:
+                    await self._send_text(user, text)
+                    step = self._send_delay
+            except Exception:
+                log.exception(
+                    "Не удалось отправить пост %s/%s пользователю %s",
+                    post.channel_username or post.channel_id,
+                    post.message_id,
+                    user.tg_id,
+                )
+                step = self._send_delay
+            if index + 1 < len(subscribers):
+                await asyncio.sleep(step)
+
+    async def _send_with_media(
         self,
-        subscribers: list[User],
-        post: PendingPost,
-        target: MirrorResult,
-    ) -> bool:
-        text = build_post_message(post, self._settings.display_timezone)
-        copied = True
-        for index, user in enumerate(subscribers):
-            if copied:
-                copied = await self._send_copy(user, target)
-                if not copied:
-                    # Копия не удалась из-за самого поста: дальше шлём текстом
-                    # и больше не пробуем копировать этот пост.
-                    await self._db.mark_post_mirror_failed(post.id)
-            if not copied:
-                await self._send_text(user, text)
-            if index + 1 < len(subscribers):
-                # Альбом — это несколько сообщений, поэтому пауза длиннее.
-                delay = self._send_delay * max(1, len(target.message_ids))
-                await asyncio.sleep(delay)
-        return copied
-
-    async def _send_texts(self, subscribers: list[User], post: PendingPost) -> None:
-        text = build_post_message(post, self._settings.display_timezone)
-        for index, user in enumerate(subscribers):
-            await self._send_text(user, text)
-            if index + 1 < len(subscribers):
-                await asyncio.sleep(self._send_delay)
-
-    async def _send_copy(self, user: User, target: MirrorResult) -> bool:
-        """True — копия ушла (или пользователь заблокирован). False — не копируется."""
+        user: User,
+        media: list[MediaItem],
+        caption: str,
+        fallback_text: str,
+    ) -> None:
+        """Отправляет медиа, а при ошибке — текстовую версию со ссылкой."""
         for attempt in range(2):
             try:
-                sent = await self._bot.copy_messages(
-                    chat_id=user.tg_id,
-                    from_chat_id=target.chat_id,
-                    message_ids=list(target.message_ids),
-                )
-                if sent is not None and len(sent) < len(target.message_ids):
-                    log.warning(
-                        "Скопировано %s из %s сообщений поста для %s",
-                        len(sent),
-                        len(target.message_ids),
-                        user.tg_id,
-                    )
-                return True
+                await self._send_media(user.tg_id, media, caption)
+                return
             except TelegramRetryAfter as exc:
                 if attempt:
                     log.warning(
-                        "Flood wait: копия поста для %s так и не отправлена",
-                        user.tg_id,
+                        "Flood wait: медиа для %s так и не отправлено", user.tg_id
                     )
-                    return True
+                    await self._send_text(user, fallback_text)
+                    return
                 wait = min(exc.retry_after + 1, MAX_RETRY_AFTER)
-                log.warning("Flood wait %s с: повторяю копию для %s", wait, user.tg_id)
+                log.warning("Flood wait %s с: повторяю медиа для %s", wait, user.tg_id)
                 await asyncio.sleep(wait)
             except TelegramForbiddenError:
                 await self._db.set_user_enabled(user.id, False)
@@ -152,18 +153,70 @@ class PostDelivery:
                     "Пользователь %s заблокировал бота — уведомления выключены",
                     user.tg_id,
                 )
-                return True
-            except TelegramBadRequest as exc:
+                return
+            except (TelegramBadRequest, TelegramAPIError, OSError) as exc:
+                # Файл больше лимита Bot API, неподдерживаемый формат и т.п.
                 log.warning(
-                    "Пост не копируется для %s: %s", user.tg_id, exc
+                    "Не удалось отправить медиа пользователю %s: %s", user.tg_id, exc
                 )
-                return False
-            except TelegramAPIError as exc:
-                log.warning(
-                    "Не удалось отправить копию пользователю %s: %s", user.tg_id, exc
+                await self._send_text(user, fallback_text)
+                return
+
+    async def _send_media(
+        self, chat_id: int, media: list[MediaItem], caption: str | None
+    ) -> None:
+        if len(media) == 1:
+            await self._send_single(chat_id, media[0], caption)
+            return
+        for offset in range(0, len(media), ALBUM_LIMIT):
+            chunk = media[offset : offset + ALBUM_LIMIT]
+            if len(chunk) == 1:
+                await self._send_single(
+                    chat_id, chunk[0], caption if offset == 0 else None
                 )
-                return True
-        return True
+                continue
+            group = []
+            for index, item in enumerate(chunk):
+                item_caption = caption if offset == 0 and index == 0 else None
+                group.append(self._input_media(item, item_caption))
+            await self._bot.send_media_group(chat_id=chat_id, media=group)  # type: ignore[arg-type]
+
+    async def _send_single(
+        self, chat_id: int, item: MediaItem, caption: str | None
+    ) -> None:
+        common: dict[str, object] = {"chat_id": chat_id, "caption": caption}
+        if caption:
+            common["parse_mode"] = "HTML"
+        file = FSInputFile(item.path)
+        kind = item.kind
+        if kind == "photo":
+            await self._bot.send_photo(photo=file, **common)  # type: ignore[arg-type]
+        elif kind == "video":
+            await self._bot.send_video(
+                video=file, supports_streaming=True, **common  # type: ignore[arg-type]
+            )
+        elif kind == "animation":
+            await self._bot.send_animation(animation=file, **common)  # type: ignore[arg-type]
+        elif kind == "audio":
+            await self._bot.send_audio(audio=file, **common)  # type: ignore[arg-type]
+        elif kind == "voice":
+            await self._bot.send_voice(voice=file, **common)  # type: ignore[arg-type]
+        else:
+            await self._bot.send_document(document=file, **common)  # type: ignore[arg-type]
+
+    def _input_media(self, item: MediaItem, caption: str | None):
+        kwargs = {"media": FSInputFile(item.path), "caption": caption}
+        if caption:
+            kwargs["parse_mode"] = "HTML"
+        if item.kind == "photo":
+            return InputMediaPhoto(**kwargs)  # type: ignore[arg-type]
+        if item.kind == "video":
+            return InputMediaVideo(**kwargs)  # type: ignore[arg-type]
+        if item.kind == "animation":
+            return InputMediaAnimation(**kwargs)  # type: ignore[arg-type]
+        if item.kind == "audio":
+            return InputMediaAudio(**kwargs)  # type: ignore[arg-type]
+        return InputMediaDocument(**kwargs)  # type: ignore[arg-type]
 
     async def _send_text(self, user: User, text: str) -> None:
         for attempt in range(2):
@@ -193,3 +246,15 @@ class PostDelivery:
                     "Не удалось отправить пост пользователю %s: %s", user.tg_id, exc
                 )
                 return
+
+    # ---------------------------------------------------------------- cleanup
+
+    @staticmethod
+    def _cleanup_media(post: PendingPost) -> None:
+        for item in post.media:
+            if not item.path:
+                continue
+            try:
+                Path(item.path).unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("Не удалось удалить медиа %s: %s", item.path, exc)

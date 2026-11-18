@@ -16,13 +16,22 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel as TgChannel
 from telethon.tl.types import Chat as TgChat
+from telethon.tl.types import (
+    DocumentAttributeAnimated,
+    DocumentAttributeAudio,
+    DocumentAttributeSticker,
+    DocumentAttributeVideo,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+    MessageMediaWebPage,
+)
 from telethon.tl.types import User as TgUser
 from telethon.utils import get_peer_id
 
 from .config import Settings
 from .db import Database
 from .delivery import PostDelivery
-from .models import Channel, ChannelInfo, NewPost
+from .models import Channel, ChannelInfo, MediaItem, NewPost
 from .utils import (
     ChannelRef,
     iso_utc,
@@ -32,6 +41,53 @@ from .utils import (
 )
 
 log = logging.getLogger(__name__)
+
+# Жёсткий лимит скачивания одного медиафайла — 200 МБ.
+MAX_MEDIA_BYTES = 200 * 1024 * 1024
+# Сколько ждать загрузки одного файла, прежде чем считать её проваленной.
+DOWNLOAD_TIMEOUT = 600
+
+
+def _media_kind(message: Any) -> str | None:
+    """Тип файлового медиа сообщения или None (превью ссылки, опрос и т.п.)."""
+    media = getattr(message, "media", None)
+    if media is None or isinstance(media, MessageMediaWebPage):
+        return None
+    if isinstance(media, MessageMediaPhoto):
+        return "photo"
+    if not isinstance(media, MessageMediaDocument):
+        return None
+    document = getattr(media, "document", None)
+    if document is None:
+        return None
+    attributes = list(getattr(document, "attributes", None) or ())
+    if any(isinstance(attr, DocumentAttributeSticker) for attr in attributes):
+        return None
+    if any(isinstance(attr, DocumentAttributeAnimated) for attr in attributes):
+        return "animation"
+    if any(isinstance(attr, DocumentAttributeVideo) for attr in attributes):
+        return "video"
+    for attr in attributes:
+        if isinstance(attr, DocumentAttributeAudio):
+            return "voice" if getattr(attr, "voice", False) else "audio"
+    return "document"
+
+
+def _media_size(message: Any) -> int:
+    """Размер файла в байтах (0, если Telegram не сообщил)."""
+    media = getattr(message, "media", None)
+    document = getattr(media, "document", None) if media is not None else None
+    size = getattr(document, "size", None) if document is not None else None
+    return int(size) if size else 0
+
+
+def _human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if value < 1024 or unit == "ГБ":
+            return f"{value:.0f} {unit}" if unit == "Б" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} Б"
 
 
 class CollectorError(RuntimeError):
@@ -252,6 +308,7 @@ class NewsCollector:
         inserted = await self._db.insert_posts(
             channel.id, posts, notify=is_first_pass
         )
+        deliver: list[NewPost] = []
         if is_first_pass and inserted:
             # Первый проход — это ещё не новости: рассылаем только последний
             # пост канала, остальные сохраняем молча как историю.
@@ -265,12 +322,102 @@ class NewsCollector:
             )
             if newest is not None:
                 await self._db.mark_post_pending(channel.id, newest.message_id)
+                deliver = [newest]
+        elif inserted:
+            deliver = list(posts)
+
+        await self._download_media_for_posts(deliver, messages, channel)
+
         await self._db.update_channel_progress(
             channel.id, max_id, iso_utc(utcnow()), None
         )
         if inserted:
             log.info("Канал %s: сохранено %s новых постов", channel.key, inserted)
         return inserted
+
+    async def _download_media_for_posts(
+        self,
+        posts: list[NewPost],
+        messages: list[Any],
+        channel: Channel,
+    ) -> None:
+        """Скачивает медиа для постов, которые вот-вот уйдут подписчикам.
+
+        Скачиваем заранее и целиком, чтобы рассылка не зависела от скорости
+        Telegram и могла повторяться после перезапуска. Посты без медиа и
+        историю первого прохода не трогаем.
+        """
+        media_posts = [post for post in posts if post.has_media]
+        if not media_posts:
+            return
+        by_id = {
+            message.id: message
+            for message in messages
+            if getattr(message, "id", None) is not None
+        }
+        for post in media_posts:
+            items = await self._download_post_media(post, by_id, channel)
+            if not items:
+                continue
+            try:
+                await self._db.set_post_media(channel.id, post.message_id, items)
+            except Exception:
+                log.exception(
+                    "Не удалось сохранить медиа поста %s/%s",
+                    channel.key,
+                    post.message_id,
+                )
+
+    async def _download_post_media(
+        self,
+        post: NewPost,
+        by_id: dict[int, Any],
+        channel: Channel,
+    ) -> list[MediaItem]:
+        """Скачивает все файлы поста (включая все элементы альбома)."""
+        items: list[MediaItem] = []
+        target_dir = (
+            self._settings.data_dir / "media" / str(channel.id) / str(post.message_id)
+        )
+        for message_id in post.source_message_ids:
+            message = by_id.get(message_id)
+            if message is None:
+                continue
+            kind = _media_kind(message)
+            if kind is None:
+                continue
+            size = _media_size(message)
+            if size > MAX_MEDIA_BYTES:
+                log.warning(
+                    "Медиа %s/%s (%s) больше %s МБ — отправлю текст со ссылкой",
+                    channel.key,
+                    message_id,
+                    _human_size(size),
+                    MAX_MEDIA_BYTES // (1024 * 1024),
+                )
+                items.append(MediaItem(kind=kind, size=size, skipped=True))
+                continue
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                path = await asyncio.wait_for(
+                    self.client.download_media(message, file=str(target_dir)),
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+            except Exception as exc:  # noqa: BLE001 - один файл не должен ломать пост
+                log.warning(
+                    "Не удалось скачать медиа %s/%s: %s: %s",
+                    channel.key,
+                    message_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                items.append(MediaItem(kind=kind, size=size, skipped=True))
+                continue
+            if not path:
+                items.append(MediaItem(kind=kind, size=size, skipped=True))
+                continue
+            items.append(MediaItem(kind=kind, path=str(path), size=size))
+        return items
 
     def _build_posts(
         self,
@@ -312,9 +459,7 @@ class NewsCollector:
                 ),
                 "",
             )
-            has_media = any(
-                getattr(message, "media", None) is not None for message in bucket
-            )
+            has_media = any(_media_kind(message) is not None for message in bucket)
             if not text and not has_media:
                 continue
             representative = ids[0]

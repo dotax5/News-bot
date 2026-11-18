@@ -57,6 +57,21 @@ class NewPost:
 
 
 @dataclass(slots=True, frozen=True)
+class MediaItem:
+    """Один медиафайл поста, уже скачанный на диск.
+
+    kind: photo | video | animation | document | audio | voice.
+    path — локальный путь к скачанному файлу (None, если файл пропущен).
+    skipped — файл не скачан (слишком большой или ошибка загрузки).
+    """
+
+    kind: str
+    path: str | None = None
+    size: int = 0
+    skipped: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class PostMirrorState:
     """Состояние копии поста в чате бота."""
 
@@ -86,6 +101,7 @@ class PendingPost:
     mirror_message_ids: tuple[int, ...]
     mirror_requested_at: str | None
     media_state: str
+    media: tuple[MediaItem, ...] = ()
 
     @property
     def copy_message_ids(self) -> tuple[int, ...]:

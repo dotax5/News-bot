@@ -4,7 +4,7 @@ import unittest
 from typing import Any
 
 from newsbot.models import PendingPost
-from newsbot.rendering import build_post_message
+from newsbot.rendering import build_post_caption, build_post_message
 from newsbot.utils import utf16_len
 
 
@@ -49,14 +49,33 @@ class PostMessageTests(unittest.TestCase):
         self.assertIn("&lt;i&gt;", text)
 
     def test_media_notes(self) -> None:
+        # Если у поста есть текст, шапка канала остаётся, а лишней пометки нет.
         with_text = build_post_message(make_post(has_media=True), "UTC")
-        self.assertIn("📎 К посту приложено медиа", with_text)
+        self.assertIn("📢 <b>Тестовый канал</b> · @test", with_text)
+        self.assertNotIn("К посту приложено медиа", with_text)
 
         media_only = build_post_message(make_post(text="", has_media=True), "UTC")
         self.assertIn("📎 Медиа без текста", media_only)
 
         text_only = build_post_message(make_post(text="", has_media=False), "UTC")
         self.assertIn("🔗 Пост без текста", text_only)
+
+    def test_caption_fits_telegram_limit(self) -> None:
+        caption = build_post_caption(
+            make_post(text="слово " * 2000, has_media=True), "UTC"
+        )
+        self.assertLessEqual(utf16_len(caption), 1000)
+        self.assertIn("📢 <b>Тестовый канал</b>", caption)
+
+    def test_caption_keeps_channel_header(self) -> None:
+        caption = build_post_caption(make_post(has_media=True), "UTC")
+        self.assertIn("📢 <b>Тестовый канал</b> · @test", caption)
+        self.assertIn("Текст новости", caption)
+
+    def test_caption_for_media_without_text_has_no_placeholder(self) -> None:
+        caption = build_post_caption(make_post(text="", has_media=True), "UTC")
+        self.assertIn("📢 <b>Тестовый канал</b>", caption)
+        self.assertNotIn("Медиа без текста", caption)
 
     def test_paragraphs_preserved(self) -> None:
         post = make_post(text="Первый   абзац.\n\n\n\nВторой абзац.")

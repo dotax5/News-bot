@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from collections.abc import Iterable, Sequence
@@ -14,6 +15,7 @@ import aiosqlite
 from .models import (
     Channel,
     ChannelInfo,
+    MediaItem,
     NewPost,
     PendingPost,
     PostMirrorState,
@@ -74,6 +76,7 @@ CREATE TABLE IF NOT EXISTS posts (
     media_state        TEXT NOT NULL DEFAULT 'pending',
     created_at  TEXT NOT NULL,
     notified_at TEXT,
+    media_json  TEXT,
     UNIQUE (channel_id, message_id)
 );
 
@@ -113,6 +116,31 @@ def _channel_from_row(row: aiosqlite.Row) -> Channel:
         last_error=row["last_error"],
         created_at=row["created_at"],
     )
+
+
+def _media_from_json(raw: str | None) -> tuple[MediaItem, ...]:
+    """Разбирает сохранённый список медиафайлов поста."""
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(data, list):
+        return ()
+    items: list[MediaItem] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        items.append(
+            MediaItem(
+                kind=str(entry.get("kind") or "document"),
+                path=entry.get("path") or None,
+                size=int(entry.get("size") or 0),
+                skipped=bool(entry.get("skipped")),
+            )
+        )
+    return tuple(items)
 
 
 class Database:
@@ -201,6 +229,7 @@ class Database:
             "mirror_message_ids": "TEXT",
             "mirror_requested_at": "TEXT",
             "media_state": "TEXT NOT NULL DEFAULT 'pending'",
+            "media_json": "TEXT",
         }
         for name, ddl in media_columns.items():
             if name not in post_columns:
@@ -552,9 +581,31 @@ class Database:
                 mirror_message_ids=parse_int_ids(row["mirror_message_ids"]),
                 mirror_requested_at=row["mirror_requested_at"],
                 media_state=row["media_state"],
+                media=_media_from_json(row["media_json"]),
             )
             for row in rows
         ]
+
+    async def set_post_media(
+        self, channel_id: int, message_id: int, media: Sequence[MediaItem]
+    ) -> None:
+        """Сохраняет список скачанных медиафайлов поста."""
+        payload = json.dumps(
+            [
+                {
+                    "kind": item.kind,
+                    "path": item.path,
+                    "size": item.size,
+                    "skipped": item.skipped,
+                }
+                for item in media
+            ],
+            ensure_ascii=False,
+        )
+        await self._execute(
+            "UPDATE posts SET media_json = ? WHERE channel_id = ? AND message_id = ?",
+            (payload, channel_id, message_id),
+        )
 
     async def get_post_mirror(self, post_id: int) -> PostMirrorState | None:
         row = await self._fetchone(

@@ -9,3 +9,5 @@ __pycache__/
 .ruff_cache/
 .opencode
 .idea
+.ai
+.DS_Store

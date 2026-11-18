@@ -18,7 +18,6 @@ from newsbot.collector import CollectorError, NewsCollector
 from newsbot.config import ConfigError, Settings, load_settings
 from newsbot.db import Database
 from newsbot.delivery import PostDelivery
-from newsbot.mirror import MediaMirror, MirrorError
 
 log = logging.getLogger(__name__)
 
@@ -75,47 +74,21 @@ async def main() -> None:
         me = await bot.get_me()
         log.info("Бот запущен: @%s", me.username)
 
-        mirror: MediaMirror | None = None
         if settings.collector_enabled:
             collector = NewsCollector(settings, db)
             await collector.start()
-            if settings.exact_copy_enabled and me.username:
-                mirror = MediaMirror(db, collector.client, me.username)
-                try:
-                    await mirror.start()
-                except MirrorError as exc:
-                    log.error(
-                        "Точная копия постов недоступна, будут приходить текст и ссылка: %s",
-                        exc,
-                    )
-                    mirror = None
-            elif not settings.exact_copy_enabled:
-                log.info("Точная копия постов выключена (EXACT_COPY_ENABLED=false)")
-            else:
-                log.warning(
-                    "У бота нет @username — точная копия постов недоступна, "
-                    "будут приходить текст и ссылка."
-                )
         else:
             log.warning(
                 "TELEGRAM_API_ID / TELEGRAM_API_HASH не заданы: сбор новостей выключен, "
                 "будут доступны только команды."
             )
 
-        delivery = PostDelivery(bot, db, settings, mirror=mirror)
+        delivery = PostDelivery(bot, db, settings)
         if collector is not None:
             collector.set_delivery(delivery)
 
         dispatcher = Dispatcher()
-        dispatcher.include_router(
-            build_router(
-                db,
-                settings,
-                collector,
-                exact_copy=mirror is not None,
-                collector_id=collector.me_id if collector else None,
-            )
-        )
+        dispatcher.include_router(build_router(db, settings, collector))
         await bot.set_my_commands(bot_commands())
 
         # Если прошлый запуск прервался между сбором поста и рассылкой,

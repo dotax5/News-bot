@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from telethon.tl.types import Channel as TgChannel
+from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 
 from newsbot.collector import NewsCollector
 from newsbot.db import Database
@@ -36,6 +37,11 @@ class FakeTelethonClient:
     def __init__(self, messages: list[FakeMessage]) -> None:
         self.messages = messages
         self.entity = TgChannel(id=123, title="Тест", photo=None, date=None, username="test")
+        self.download_calls: list[int] = []
+
+    async def download_media(self, message, file: str) -> str:
+        self.download_calls.append(message.id)
+        return str(Path(file) / f"{message.id}.bin")
 
     async def get_entity(self, ref):
         return self.entity
@@ -62,9 +68,19 @@ class FakeTelethonClient:
 class FakeBot:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.captions: list[str] = []
 
     async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
         self.sent.append((chat_id, text))
+
+    async def send_photo(self, chat_id: int, photo, caption=None, **kwargs) -> None:
+        self.captions.append(caption or "")
+
+    async def send_video(self, chat_id: int, video, caption=None, **kwargs) -> None:
+        self.captions.append(caption or "")
+
+    async def send_media_group(self, chat_id: int, media, **kwargs) -> None:
+        self.captions.extend(item.caption or "" for item in media)
 
 
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
@@ -77,6 +93,7 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             initial_fetch_limit=20,
             collect_interval=60,
             display_timezone="Europe/Moscow",
+            data_dir=Path(self._tmp.name),
         )
         self.bot = FakeBot()
         self.delivery = PostDelivery(
@@ -185,10 +202,18 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         )
         messages = [
             FakeMessage(
-                10, "Подпись к альбому", self.now, media=object(), grouped_id=77
+                10,
+                "Подпись к альбому",
+                self.now,
+                media=MessageMediaPhoto(photo=None),
+                grouped_id=77,
             ),
-            FakeMessage(11, "", self.now, media=object(), grouped_id=77),
-            FakeMessage(12, "", self.now, media=object(), grouped_id=77),
+            FakeMessage(
+                11, "", self.now, media=MessageMediaPhoto(photo=None), grouped_id=77
+            ),
+            FakeMessage(
+                12, "", self.now, media=MessageMediaPhoto(photo=None), grouped_id=77
+            ),
         ]
         collector = self._collector(FakeTelethonClient(messages), with_delivery=False)
 
@@ -205,17 +230,79 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         messages = [
             FakeMessage(10, "Старый альбом", self.now - timedelta(hours=1), grouped_id=1),
             FakeMessage(11, "", self.now - timedelta(hours=1), grouped_id=1),
-            FakeMessage(12, "Новый альбом", self.now, media=object(), grouped_id=2),
-            FakeMessage(13, "", self.now, media=object(), grouped_id=2),
+            FakeMessage(
+                12,
+                "Новый альбом",
+                self.now,
+                media=MessageMediaPhoto(photo=None),
+                grouped_id=2,
+            ),
+            FakeMessage(
+                13, "", self.now, media=MessageMediaPhoto(photo=None), grouped_id=2
+            ),
         ]
         collector = self._collector(FakeTelethonClient(messages))
 
         await collector.collect_once()
 
-        self.assertEqual(len(self.bot.sent), 1)
-        self.assertIn("Новый альбом", self.bot.sent[0][1])
-        self.assertNotIn("Старый альбом", self.bot.sent[0][1])
+        # Пост с медиа уходит подписчику подписью к альбому.
+        self.assertEqual(self.bot.sent, [])
+        self.assertTrue(self.bot.captions)
+        self.assertIn("Новый альбом", self.bot.captions[0])
+        self.assertNotIn("Старый альбом", self.bot.captions[0])
         self.assertEqual(await self.db.list_pending_posts(), [])
+
+    async def test_oversized_media_is_skipped_without_download(self) -> None:
+        await self.db.update_channel_progress(
+            self.channel.id, 9, self.now.isoformat()
+        )
+        huge = 250 * 1024 * 1024
+        document = SimpleNamespace(size=huge, attributes=[])
+        client = FakeTelethonClient(
+            [
+                FakeMessage(
+                    10,
+                    "Слишком большой файл",
+                    self.now,
+                    media=MessageMediaDocument(document=document),
+                )
+            ]
+        )
+        collector = self._collector(client, with_delivery=False)
+
+        await collector.collect_once()
+
+        pending = await self.db.list_pending_posts()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(client.download_calls, [])
+        self.assertEqual(len(pending[0].media), 1)
+        self.assertTrue(pending[0].media[0].skipped)
+        self.assertIsNone(pending[0].media[0].path)
+
+    async def test_downloadable_media_is_saved_before_delivery(self) -> None:
+        await self.db.update_channel_progress(
+            self.channel.id, 9, self.now.isoformat()
+        )
+        document = SimpleNamespace(size=1024, attributes=[])
+        client = FakeTelethonClient(
+            [
+                FakeMessage(
+                    10,
+                    "Файл",
+                    self.now,
+                    media=MessageMediaDocument(document=document),
+                )
+            ]
+        )
+        collector = self._collector(client, with_delivery=False)
+
+        await collector.collect_once()
+
+        pending = await self.db.list_pending_posts()
+        self.assertEqual(client.download_calls, [10])
+        self.assertEqual(len(pending[0].media), 1)
+        self.assertFalse(pending[0].media[0].skipped)
+        self.assertTrue(pending[0].media[0].path)
 
 
 if __name__ == "__main__":

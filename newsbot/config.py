@@ -32,7 +32,6 @@ class Settings:
     initial_fetch_limit: int
     source_channels: tuple[str, ...]
     auto_subscribe_env_channels: bool
-    exact_copy_enabled: bool
     log_level: str
 
     @property
@@ -128,6 +127,5 @@ def load_settings() -> Settings:
         initial_fetch_limit=max(_env_int("INITIAL_FETCH_LIMIT", 20, 1), 1),
         source_channels=_split_list(os.getenv("SOURCE_CHANNELS", "")),
         auto_subscribe_env_channels=_env_bool("AUTO_SUBSCRIBE_ENV_CHANNELS", True),
-        exact_copy_enabled=_env_bool("EXACT_COPY_ENABLED", True),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
     )
