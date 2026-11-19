@@ -84,6 +84,10 @@ async def main() -> None:
             )
 
         delivery = PostDelivery(bot, db, settings)
+        try:
+            await delivery.purge_orphaned_media()
+        except Exception:
+            log.exception("Не удалось очистить устаревшие медиафайлы при запуске")
         if collector is not None:
             collector.set_delivery(delivery)
 

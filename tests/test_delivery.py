@@ -115,11 +115,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         path.write_bytes(b"media")
         return str(path)
 
-    def _delivery(self, bot: FakeBot) -> PostDelivery:
+    def _delivery(self, bot: FakeBot, *, data_dir: Path | None = None) -> PostDelivery:
         return PostDelivery(
             bot,  # type: ignore[arg-type]
             self.db,
-            SimpleNamespace(display_timezone="Europe/Moscow"),  # type: ignore[arg-type]
+            SimpleNamespace(  # type: ignore[arg-type]
+                display_timezone="Europe/Moscow",
+                data_dir=data_dir or Path(self._tmp.name),
+            ),
             send_delay=0,
         )
 
@@ -241,6 +244,61 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([chat_id for chat_id, _ in bot.sent], [111])
         self.assertEqual(await self.db.list_pending_posts(), [])
+
+    async def test_cleanup_runs_when_sending_raises(self) -> None:
+        await self._subscribe(111)
+        await self._insert_post(has_media=True)
+        media_dir = Path(self._tmp.name) / "media" / str(self.channel.id) / "1"
+        media_dir.mkdir(parents=True)
+        path = media_dir / "photo.jpg"
+        path.write_bytes(b"media")
+        await self.db.set_post_media(
+            self.channel.id, 1, (MediaItem(kind="photo", path=str(path), size=5),)
+        )
+        delivery = self._delivery(FakeBot())
+
+        with patch.object(delivery, "_send_post", side_effect=RuntimeError("boom")):
+            delivered = await delivery.deliver_pending()
+
+        self.assertEqual(delivered, 1)
+        self.assertFalse(path.exists())
+        self.assertFalse(media_dir.exists())
+        self.assertEqual(await self.db.list_pending_posts(), [])
+
+    async def test_purge_orphaned_media_keeps_pending_files(self) -> None:
+        media_root = Path(self._tmp.name) / "media"
+        post_dir = media_root / str(self.channel.id) / "1"
+        post_dir.mkdir(parents=True)
+        keep = post_dir / "keep.jpg"
+        keep.write_bytes(b"media")
+        orphan_dir = media_root / "99999" / "1"
+        orphan_dir.mkdir(parents=True)
+        orphan = orphan_dir / "orphan.jpg"
+        orphan.write_bytes(b"media")
+        empty_dir = media_root / "88888" / "2"
+        empty_dir.mkdir(parents=True)
+        await self._insert_post(has_media=True)
+        await self.db.set_post_media(
+            self.channel.id, 1, (MediaItem(kind="photo", path=str(keep), size=5),)
+        )
+        delivery = self._delivery(FakeBot())
+
+        deleted = await delivery.purge_orphaned_media()
+
+        self.assertEqual(deleted, 1)
+        self.assertTrue(keep.exists())
+        self.assertFalse(orphan.exists())
+        self.assertFalse(orphan_dir.exists())
+        self.assertFalse(empty_dir.exists())
+        self.assertFalse(empty_dir.parent.exists())
+        self.assertTrue(post_dir.exists())
+
+    async def test_purge_orphaned_media_without_media_dir(self) -> None:
+        delivery = self._delivery(
+            FakeBot(), data_dir=Path(self._tmp.name) / "missing"
+        )
+
+        self.assertEqual(await delivery.purge_orphaned_media(), 0)
 
     async def test_post_without_subscribers_is_marked_delivered(self) -> None:
         user = await self._subscribe(111)

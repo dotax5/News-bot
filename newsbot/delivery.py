@@ -69,29 +69,31 @@ class PostDelivery:
     async def _deliver_pending(self) -> int:
         posts = await self._db.list_pending_posts()
         for post in posts:
-            subscribers = await self._db.list_channel_subscribers(post.channel_id)
-            if not subscribers:
-                await self._db.mark_post_notified(post.id, iso_utc(utcnow()))
-                self._cleanup_media(post)
-                continue
-
             try:
-                await self._send_post(subscribers, post)
-            except Exception:
-                log.exception(
-                    "Не удалось разослать пост %s/%s",
+                subscribers = await self._db.list_channel_subscribers(post.channel_id)
+                if not subscribers:
+                    await self._db.mark_post_notified(post.id, iso_utc(utcnow()))
+                    continue
+
+                try:
+                    await self._send_post(subscribers, post)
+                except Exception:
+                    log.exception(
+                        "Не удалось разослать пост %s/%s",
+                        post.channel_username or post.channel_id,
+                        post.message_id,
+                    )
+                await self._db.mark_post_notified(post.id, iso_utc(utcnow()))
+                log.info(
+                    "Пост %s/%s разослан %s подписчикам (%s)",
                     post.channel_username or post.channel_id,
                     post.message_id,
+                    len(subscribers),
+                    "медиа" if any(item.path for item in post.media) else "текст",
                 )
-            await self._db.mark_post_notified(post.id, iso_utc(utcnow()))
-            self._cleanup_media(post)
-            log.info(
-                "Пост %s/%s разослан %s подписчикам (%s)",
-                post.channel_username or post.channel_id,
-                post.message_id,
-                len(subscribers),
-                "медиа" if any(item.path for item in post.media) else "текст",
-            )
+            finally:
+                # Файлы удаляем всегда, даже если отправка или запись в БД упали.
+                self._cleanup_media(post)
         return len(posts)
 
     # ---------------------------------------------------------------- sending
@@ -251,10 +253,73 @@ class PostDelivery:
 
     @staticmethod
     def _cleanup_media(post: PendingPost) -> None:
+        directories: set[Path] = set()
         for item in post.media:
             if not item.path:
                 continue
+            path = Path(item.path)
             try:
-                Path(item.path).unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except OSError as exc:
                 log.warning("Не удалось удалить медиа %s: %s", item.path, exc)
+            directories.add(path.parent)
+
+        # Убираем опустевший каталог поста и, если он тоже пуст, каталог канала.
+        for directory in directories:
+            for candidate in (directory, directory.parent):
+                try:
+                    candidate.rmdir()
+                except OSError:
+                    break
+
+    async def purge_orphaned_media(self) -> int:
+        """Удаляет файлы из data/media, на которые не ссылаются ожидающие посты."""
+        media_root = self._settings.data_dir / "media"
+        if not media_root.is_dir():
+            return 0
+
+        referenced: set[Path] = set()
+        for post in await self._db.list_pending_posts():
+            for item in post.media:
+                if not item.path:
+                    continue
+                path = Path(item.path)
+                try:
+                    referenced.add(path.resolve())
+                except OSError:
+                    referenced.add(path.absolute())
+
+        deleted = 0
+        removed_dirs = 0
+        # Обходим снизу вверх: сначала файлы, затем опустевшие каталоги.
+        entries = sorted(
+            media_root.rglob("*"), key=lambda path: len(path.parts), reverse=True
+        )
+        for path in entries:
+            try:
+                if path.is_dir():
+                    path.rmdir()
+                    removed_dirs += 1
+                    continue
+                if not path.is_file() and not path.is_symlink():
+                    continue
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    resolved = path.absolute()
+                if resolved in referenced:
+                    continue
+                path.unlink(missing_ok=True)
+                deleted += 1
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.debug("Не удалось очистить %s: %s", path, exc)
+
+        log.info(
+            "Очистка data/media: удалено %s файлов и %s пустых каталогов",
+            deleted,
+            removed_dirs,
+        )
+        return deleted
+
