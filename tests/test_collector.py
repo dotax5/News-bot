@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+from telethon.errors import AuthKeyUnregisteredError
 from telethon.tl.types import Channel as TgChannel
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 
+import newsbot.collector as collector_module
 from newsbot.collector import NewsCollector
 from newsbot.db import Database
 from newsbot.delivery import PostDelivery
@@ -38,6 +42,15 @@ class FakeTelethonClient:
         self.messages = messages
         self.entity = TgChannel(id=123, title="Тест", photo=None, date=None, username="test")
         self.download_calls: list[int] = []
+        self.connect_calls = 0
+        self.connected = True
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+        self.connected = True
 
     async def download_media(self, message, file: str) -> str:
         self.download_calls.append(message.id)
@@ -63,6 +76,56 @@ class FakeTelethonClient:
 
     def push(self, message: FakeMessage) -> None:
         self.messages.append(message)
+
+
+class FlakyTelethonClient(FakeTelethonClient):
+    """Связь рвётся на первом чтении, но connect() её восстанавливает."""
+
+    def __init__(self, messages: list[FakeMessage]) -> None:
+        super().__init__(messages)
+        self.read_calls = 0
+        self._fail_next_read = True
+
+    async def get_messages(self, entity, limit=20):
+        self.read_calls += 1
+        if self._fail_next_read:
+            self._fail_next_read = False
+            self.connected = False
+            raise ConnectionError("Cannot send requests while disconnected")
+        return await super().get_messages(entity, limit)
+
+
+class DeadTelethonClient(FakeTelethonClient):
+    """Клиент не поднимается: connect() не помогает."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.connected = False
+        self.read_calls = 0
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+
+    async def get_messages(self, entity, limit=20):
+        self.read_calls += 1
+        raise ConnectionError("Cannot send requests while disconnected")
+
+    async def iter_messages(self, entity, min_id=0, limit=100, reverse=False):
+        self.read_calls += 1
+        raise ConnectionError("Cannot send requests while disconnected")
+        yield  # pragma: no cover
+
+
+class RevokedSessionClient(FakeTelethonClient):
+    """Telegram отвечает, что сессия отозвана."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.read_calls = 0
+
+    async def get_messages(self, entity, limit=20):
+        self.read_calls += 1
+        raise AuthKeyUnregisteredError(request=None)
 
 
 class FakeBot:
@@ -303,6 +366,65 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pending[0].media), 1)
         self.assertFalse(pending[0].media[0].skipped)
         self.assertTrue(pending[0].media[0].path)
+
+    async def test_disconnected_client_reconnects_and_collects(self) -> None:
+        client = FlakyTelethonClient(
+            [FakeMessage(3, "Новая", self.now - timedelta(minutes=5))]
+        )
+        collector = self._collector(client)  # type: ignore[arg-type]
+
+        with mock.patch.object(
+            collector_module, "RECONNECT_BACKOFF", (0.0, 0.0)
+        ):
+            self.assertEqual(await collector.collect_once(), 1)
+
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.read_calls, 2)
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertIn("Новая", self.bot.sent[0][1])
+        channel = await self.db.find_user_channel_by_ref(self.user.id, "@test")
+        assert channel is not None
+        self.assertEqual(channel.last_message_id, 3)
+
+    async def test_dead_client_aborts_pass_without_channel_errors(self) -> None:
+        second, _ = await self.db.add_or_update_channel(
+            ChannelInfo(
+                key="@second", tg_id=-100124, username="second", title="Второй"
+            )
+        )
+        await self.db.subscribe(self.user.id, second.id)
+        client = DeadTelethonClient()
+        collector = self._collector(client)  # type: ignore[arg-type]
+
+        with mock.patch.object(
+            collector_module, "RECONNECT_BACKOFF", (0.0, 0.0)
+        ):
+            self.assertEqual(await collector.collect_once(), 0)
+
+        # Одна попытка и два ограниченных ретрая, дальше проход прерван.
+        self.assertEqual(client.connect_calls, 3)
+        # Второй канал вообще не трогали: ни одного чтения из Telegram.
+        self.assertEqual(client.read_calls, 0)
+        self.assertEqual(self.bot.sent, [])
+        for raw in ("@test", "@second"):
+            channel = await self.db.find_user_channel_by_ref(self.user.id, raw)
+            assert channel is not None
+            self.assertIsNone(channel.last_error)
+
+    async def test_revoked_session_stops_collector_without_retries(self) -> None:
+        client = RevokedSessionClient()
+        collector = self._collector(client)  # type: ignore[arg-type]
+
+        self.assertEqual(await collector.collect_once(), 0)
+        self.assertTrue(collector._fatal_error)
+        self.assertEqual(client.read_calls, 1)
+        self.assertEqual(client.connect_calls, 0)
+
+        stop_event = asyncio.Event()
+        await asyncio.wait_for(collector.run(stop_event), timeout=2)
+        self.assertTrue(stop_event.is_set())
+        # Повторных обращений к Telegram не было.
+        self.assertEqual(client.read_calls, 2)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,12 @@ class FakeTelethon:
         )
         self.downloads: list[int] = []
 
+    def is_connected(self) -> bool:
+        return True
+
+    async def connect(self) -> None:
+        pass
+
     async def get_entity(self, ref):
         return self.channel
 

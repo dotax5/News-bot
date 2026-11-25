@@ -8,8 +8,10 @@ from typing import Any
 
 from telethon import TelegramClient
 from telethon.errors import (
+    AuthKeyUnregisteredError,
     ChannelPrivateError,
     FloodWaitError,
+    UnauthorizedError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
@@ -46,6 +48,17 @@ log = logging.getLogger(__name__)
 MAX_MEDIA_BYTES = 200 * 1024 * 1024
 # Сколько ждать загрузки одного файла, прежде чем считать её проваленной.
 DOWNLOAD_TIMEOUT = 600
+# Паузы перед повторными попытками после потери связи (секунды).
+# Пропуск прохода дешевле, чем минуты ожидания внутри одного прохода.
+RECONNECT_BACKOFF: tuple[float, ...] = (2.0, 5.0)
+# Предел ожидания установки соединения и ответа на запрос истории.
+CONNECT_TIMEOUT = 30.0
+FETCH_TIMEOUT = 120.0
+# Проблемы транспорта: связь с Telegram пропала, нужен реконнект.
+# OSError сюда не входит: ошибки диска/БД реконнектом не лечатся.
+TRANSPORT_ERRORS = (ConnectionError, ConnectionResetError, TimeoutError)
+# Отозванная сессия: ретраи бессмысленны, нужен `python login.py`.
+AUTH_ERRORS = (UnauthorizedError, AuthKeyUnregisteredError)
 
 
 def _media_kind(message: Any) -> str | None:
@@ -107,6 +120,7 @@ class NewsCollector:
         self._client: TelegramClient | None = None
         self._entity_cache: dict[int, tuple[Any, str | None, int]] = {}
         self._dialogs_refreshed = False
+        self._fatal_error = False
         self.me: str | None = None
         self.me_id: int | None = None
 
@@ -119,6 +133,33 @@ class NewsCollector:
         if self._client is None:
             raise CollectorError("Сборщик не запущен.")
         return self._client
+
+    async def _ensure_connected(self) -> None:
+        """Проверяет связь с Telegram и при необходимости переподключается.
+
+        Бросает ConnectionError, если клиент так и не поднялся: для вызывающего
+        кода это временная ошибка транспорта, а не проблема конкретного канала.
+        """
+        if self._client is None:
+            raise CollectorError("Сборщик не запущен.")
+        if self._client.is_connected():
+            return
+
+        log.warning("Соединение с Telegram потеряно, переподключаюсь")
+        try:
+            await asyncio.wait_for(
+                self._client.connect(), timeout=CONNECT_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ConnectionError(
+                "Не удалось переподключиться к Telegram: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not self._client.is_connected():
+            raise ConnectionError("Нет соединения с Telegram.")
 
     async def start(self) -> None:
         if not self._settings.collector_enabled:
@@ -200,6 +241,9 @@ class NewsCollector:
             return await self.client.get_entity(ref.peer_id)
         except FloodWaitError:
             raise
+        except TRANSPORT_ERRORS:
+            # Потерю связи обрабатывает collect_once: это не ошибка канала.
+            raise
         except Exception as first_error:
             if not self._dialogs_refreshed:
                 await self._refresh_dialogs()
@@ -208,6 +252,8 @@ class NewsCollector:
                         return await self.client.get_entity(ref.username)
                     assert ref.peer_id is not None
                     return await self.client.get_entity(ref.peer_id)
+                except TRANSPORT_ERRORS:
+                    raise
                 except Exception as second_error:
                     raise self._friendly_error(ref, second_error) from second_error
             raise self._friendly_error(ref, first_error) from first_error
@@ -261,24 +307,66 @@ class NewsCollector:
         """Один проход по всем каналам. Возвращает число новых постов."""
         channels = await self._db.channels_to_collect()
         total_new = 0
+        self._fatal_error = False
         for channel in channels:
-            try:
-                total_new += await self._collect_channel(channel)
-            except FloodWaitError as exc:
-                wait_for = min(int(getattr(exc, "seconds", 60)), 300)
-                log.warning("Telegram просит подождать %s с (flood wait)", wait_for)
-                await self._db.set_channel_error(
-                    channel.id, f"Лимит Telegram: повтор через {wait_for} с"
-                )
-                await asyncio.sleep(wait_for)
-            except CollectorError as exc:
-                log.warning("Канал %s: %s", channel.key, exc)
-                await self._db.set_channel_error(channel.id, str(exc))
-            except Exception as exc:
-                log.exception("Ошибка сбора из канала %s", channel.key)
-                await self._db.set_channel_error(
-                    channel.id, f"{type(exc).__name__}: {exc}"
-                )
+            abort_pass = False
+            attempts = 0
+            while True:
+                try:
+                    await self._ensure_connected()
+                    total_new += await self._collect_channel(channel)
+                    break
+                except AUTH_ERRORS as exc:
+                    self._fatal_error = True
+                    log.error(
+                        "Сессия Telegram отозвана (%s). TELEGRAM_SESSION больше "
+                        "не действителен: выполните `python login.py`, обновите "
+                        "строку сессии и перезапустите бота. Сбор новостей "
+                        "остановлен, чтобы не нагружать Telegram.",
+                        type(exc).__name__,
+                    )
+                    break
+                except TRANSPORT_ERRORS as exc:
+                    if attempts >= len(RECONNECT_BACKOFF):
+                        log.warning(
+                            "Соединение с Telegram не восстанавливается (%s): "
+                            "проход сбора прерван, повторю по расписанию",
+                            type(exc).__name__,
+                        )
+                        abort_pass = True
+                        break
+                    delay = RECONNECT_BACKOFF[attempts]
+                    attempts += 1
+                    log.warning(
+                        "Соединение с Telegram потеряно (%s), повторяю канал "
+                        "%s через %s с",
+                        type(exc).__name__,
+                        channel.key,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                except FloodWaitError as exc:
+                    wait_for = min(int(getattr(exc, "seconds", 60)), 300)
+                    log.warning(
+                        "Telegram просит подождать %s с (flood wait)", wait_for
+                    )
+                    await self._db.set_channel_error(
+                        channel.id, f"Лимит Telegram: повтор через {wait_for} с"
+                    )
+                    await asyncio.sleep(wait_for)
+                    break
+                except CollectorError as exc:
+                    log.warning("Канал %s: %s", channel.key, exc)
+                    await self._db.set_channel_error(channel.id, str(exc))
+                    break
+                except Exception as exc:
+                    log.exception("Ошибка сбора из канала %s", channel.key)
+                    await self._db.set_channel_error(
+                        channel.id, f"{type(exc).__name__}: {exc}"
+                    )
+                    break
+            if abort_pass or self._fatal_error:
+                break
             # Рассылаем сразу после каждого канала: подписчики не ждут
             # окончания прохода по всем источникам.
             await self._deliver()
@@ -295,6 +383,7 @@ class NewsCollector:
             log.exception("Не удалось разослать новые посты")
 
     async def _collect_channel(self, channel: Channel) -> int:
+        await self._ensure_connected()
         entity, username, peer_id = await self._entity_for_channel(channel)
         messages = await self._fetch_messages(entity, channel)
         is_first_pass = channel.last_message_id <= 0
@@ -478,20 +567,26 @@ class NewsCollector:
 
     async def _fetch_messages(self, entity: Any, channel: Channel) -> list[Any]:
         if channel.last_message_id <= 0:
-            messages = await self.client.get_messages(
-                entity, limit=self._settings.initial_fetch_limit
+            messages = await asyncio.wait_for(
+                self.client.get_messages(
+                    entity, limit=self._settings.initial_fetch_limit
+                ),
+                timeout=FETCH_TIMEOUT,
             )
             return list(reversed(list(messages or [])))
 
-        return [
-            message
-            async for message in self.client.iter_messages(
-                entity,
-                min_id=channel.last_message_id,
-                limit=100,
-                reverse=True,
-            )
-        ]
+        async def collect() -> list[Any]:
+            return [
+                message
+                async for message in self.client.iter_messages(
+                    entity,
+                    min_id=channel.last_message_id,
+                    limit=100,
+                    reverse=True,
+                )
+            ]
+
+        return await asyncio.wait_for(collect(), timeout=FETCH_TIMEOUT)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         log.info(
@@ -503,6 +598,14 @@ class NewsCollector:
                 await self.collect_once()
             except Exception:
                 log.exception("Не удалось выполнить проход сбора")
+
+            if self._fatal_error:
+                log.error(
+                    "Цикл сбора остановлен: сессия Telegram отозвана. "
+                    "Запустите `python login.py` и перезапустите бота."
+                )
+                stop_event.set()
+                return
 
             elapsed = (utcnow() - started).total_seconds()
             delay = max(30.0, self._settings.collect_interval - elapsed)
